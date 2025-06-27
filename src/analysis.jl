@@ -176,7 +176,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                 #ConjugateGradient(),                
                 Optim.Options(
                     iterations = receiver.Params.MaxIter,
-                    f_tol = receiver.Params.RelTol,
+                    f_reltol = receiver.Params.RelTol,
                     ))            
 
             min = Optim.minimizer(res)
