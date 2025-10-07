@@ -6,7 +6,7 @@
 function lossFunc(xyznew::Matrix{Float64}, lengths::Vector{Float64}, forces::Vector{Float64}, receiver::Receiver, q::Vector{Float64})
     loss = 0.0
     #Enforce parameter bounds on q restrict the search space to feasible values
-    loss += pBounds(q, receiver.Params.LB, receiver.Params.UB, 10.0, 10.0)
+    loss += pBounds(diag(q), receiver.Params.LB, receiver.Params.UB, 10.0, 10.0)
 
     #evaluate objective and return composite loss
     for obj in receiver.Params.Objectives

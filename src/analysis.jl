@@ -28,7 +28,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             HTTP.WebSockets.send(ws, J3.write(msgout))
             
         else
-            try
+
                 
             
             println("OPTIMIZING")
@@ -164,6 +164,8 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             grad = similar(parameters)
             DI.gradient!(obj, grad, prep, backend, parameters)
 
+            println(grad)
+
 
             res = optimize( 
                 obj, 
@@ -211,8 +213,6 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
 
         HTTP.WebSockets.send(ws, J3.write(msgout))
 
-        catch error
-            println(error)
-        end
+
     end
 end

@@ -23,11 +23,8 @@ function start!(;host = "127.0.0.1", port = 2000)
                 break
             end
 
-            try
-            @async readMSG(msg, ws)
-            catch error
-                println(error)
-            end
+             readMSG(msg, ws)
+
         end
     end
 
@@ -58,31 +55,26 @@ function readMSG(msg, ws)
         end
 
         # ANALYSIS
-        try
-            # DESERIALIZE MESSAGE
-            problem = J3.read(msg)
-            
-            # MAIN ALGORITHM
-            println("READING DATA")
 
-            # CONVERT MESSAGE TO RECEIVER TYPE
-            receiver = Receiver(problem)
+        # DESERIALIZE MESSAGE
+        problem = J3.read(msg)
 
-            # SOLVE
-            if counter == 0
-                println("First run will take a while.")
-                println("Julia needs to compile the code for the first run.")
-            end
-            
-            # OPTIMIZATION
-            global simulating = true
-            @time FDMoptim!(receiver, ws)
-           
-        catch error
-            println("INVALID INPUT")
-            println("CHECK PARAMETER BOUNDS")
-            println(error)
+        # MAIN ALGORITHM
+        println("READING DATA")
+
+        # CONVERT MESSAGE TO RECEIVER TYPE
+        receiver = Receiver(problem)
+
+        # SOLVE
+        if counter == 0
+            println("First run will take a while.")
+            println("Julia needs to compile the code for the first run.")
         end
+        
+        # OPTIMIZATION
+        global simulating = true
+        @time FDMoptim!(receiver, ws)
+           
         
         println("DONE")
         global simulating = false
