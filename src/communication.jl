@@ -61,8 +61,7 @@ function readMSG(msg, ws)
         try
             # DESERIALIZE MESSAGE
             problem = J3.read(msg)
-            println(J3.pretty(problem))
-
+            
             # MAIN ALGORITHM
             println("READING DATA")
 

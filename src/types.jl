@@ -129,7 +129,7 @@ end
 struct Receiver
 
     #FORCE DENSITY
-    Q::Vector{Float64}
+    Q::SparseMatrixCSC{Float64, Int64}
 
     #NETWORK INFORMATION
     N::Vector{Int64}
@@ -151,9 +151,9 @@ struct Receiver
 
 
     #constructor
-    function Receiver(problem::Dict)
+    function Receiver(problem::J3.Object)
         #anchor geometry
-        xyzf = problem["XYZf"]
+        xyzf = problem.XYZf
         xyzf = reduce(hcat, xyzf)
         xyzf = convert(Matrix{Float64}, xyzf')
 
@@ -171,8 +171,6 @@ struct Receiver
         end
         
         q = spdiagm(q)
-
-        println(typeof(q))
 
         # free/fixed
         N = Int.(problem["Network"]["FreeNodes"]) .+ 1

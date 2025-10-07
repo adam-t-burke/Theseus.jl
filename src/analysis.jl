@@ -19,13 +19,13 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             msgout = Dict("Finished" => true,
                     "Iter" => 1, 
                     "Loss" => 0.,
-                    "Q" => receiver.Q, 
+                    "Q" => diag(receiver.Q), 
                     "X" => xyz[:,1], 
                     "Y" => xyz[:,2], 
                     "Z" => xyz[:,3],
                     "Losstrace" => [0.])
 
-            HTTP.WebSockets.send(ws, json(msgout))
+            HTTP.WebSockets.send(ws, J3.write(msgout))
             
         else
             try
@@ -125,12 +125,12 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                             msgout = Dict("Finished" => false,
                                 "Iter" => i, 
                                 "Loss" => loss,
-                                "Q" => Q, 
+                                "Q" => diag(Q), 
                                 "X" => xyzfull[:,1], 
                                 "Y" => xyzfull[:,2], 
                                 "Z" => xyzfull[:,3],
                                 "Losstrace" => losses)
-                            HTTP.WebSockets.send(ws, json(msgout))
+                            HTTP.WebSockets.send(ws, J3.write(msgout))
                         end
                     end
                     i += 1
@@ -201,7 +201,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             msgout = Dict("Finished" => true,
                 "Iter" => counter,
                 "Loss" => Optim.minimum(res),
-                "Q" => min[1:receiver.ne],
+                "Q" => diag(min[1:receiver.ne]),
                 "X" => xyz_final[:, 1],
                 "Y" => xyz_final[:, 2],
                 "Z" => xyz_final[:, 3],
@@ -209,7 +209,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                 "NodeTrace" => NodeTrace)
 
 
-        HTTP.WebSockets.send(ws, json(msgout))
+        HTTP.WebSockets.send(ws, J3.write(msgout))
 
         catch error
             println(error)

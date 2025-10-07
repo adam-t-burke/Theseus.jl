@@ -24,6 +24,7 @@ include("communication.jl")
 include("objectives.jl")
 include("adjoint.jl")
 include("anchors.jl")
+include("utils.jl")
 
 export start!, kill!
 
