@@ -3,14 +3,14 @@ import HTTP.WebSockets
 ### optimiztaion
 function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
 
-        sp_init = collect(Int64, range(1, length = receiver.ne))
+
 
         # objective function
         if isnothing(receiver.Params) || isnothing(receiver.Params.Objectives) || isempty(receiver.Params.Objectives)
 
             println("SOLVING")
 
-            xyznew = solve_explicit(receiver.Q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf, sp_init)
+            xyznew = solve_explicit(receiver.Q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf)
 
             xyz = zeros(receiver.nn, 3)
             xyz[receiver.N, :] = xyznew
@@ -52,7 +52,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
 
                 xyzf = combineSorted(newXYZf, oldXYZf, receiver.AnchorParams.VAI, receiver.AnchorParams.FAI)
 
-                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, xyzf, sp_init)
+                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, xyzf)
 
                 xyzfull = vcat(xyznew, xyzf)
                 
@@ -77,7 +77,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             function obj(q)
                 #q = clamp.(q, receiver.Params.LB, receiver.Params.UB)           
 
-                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf, sp_init)
+                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf)
                 
                 xyzfull = vcat(xyznew, receiver.XYZf)  
                 
@@ -142,21 +142,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             """
             Gradient function, returns a vector of gradients wrt the parameters.
             """
-            max_norm = 1.0
-
-            function g!(G, θ)
-                grad = gradient(θ) do q
-                   obj(q)
-                end
-                G .= grad[1]
-            end
             
-            #todo add explicit gradient for distance conditions from Schek
-            #to use when draping only
-            function drape!(G, θ)
-                grad = nothing
-                G .= grad[1]
-            end
 
             """
             Optimization
@@ -168,16 +154,27 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                 obj = obj_xyz
                 parameters = vcat(receiver.Q, receiver.AnchorParams.Init)
             end
-            res = Optim.optimize( 
+
+
+            """
+            Mooncake setup
+            """
+            backend = AutoMooncake(; config=nothing)
+            prep = DI.prepare_gradient(obj, backend, parameters)
+            grad = similar(parameters)
+            DI.gradient!(obj, grad, prep, backend, parameters)
+
+
+            res = optimize( 
                 obj, 
-                g!,
+                DI.gradient,
                 parameters,
                 LBFGS(),
                 #ConjugateGradient(),                
                 Optim.Options(
                     iterations = receiver.Params.MaxIter,
                     f_reltol = receiver.Params.RelTol,
-                    ))            
+                    ))     
 
             min = Optim.minimizer(res)
     
@@ -190,13 +187,13 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             println("SOLUTION FOUND")
             # PARSING SOLUTION
             if isnothing(receiver.AnchorParams)
-                xyz_final = solve_explicit(min, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf, sp_init)
+                xyz_final = solve_explicit(min, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf)
                 xyz_final = vcat(xyz_final, receiver.XYZf)
             else
                 newXYZf = reshape(min[receiver.ne+1:end], (:, 3))
                 oldXYZf = receiver.XYZf[receiver.AnchorParams.FAI, :]
                 XYZf_final = combineSorted(newXYZf, oldXYZf, receiver.AnchorParams.VAI, receiver.AnchorParams.FAI)
-                xyz_final = solve_explicit(min[1:receiver.ne], receiver.Cn, receiver.Cf, receiver.Pn, XYZf_final, sp_init)
+                xyz_final = solve_explicit(min[1:receiver.ne], receiver.Cn, receiver.Cf, receiver.Pn, XYZf_final)
                 xyz_final = vcat(xyz_final, XYZf_final)
             end
 

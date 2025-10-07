@@ -168,7 +168,11 @@ struct Receiver
             q = Float64.(problem["Q"])
         else
             q = repeat(1.0, ne)
-        end        
+        end
+        
+        q = spdiagm(q)
+
+        println(typeof(q))
 
         # free/fixed
         N = Int.(problem["Network"]["FreeNodes"]) .+ 1

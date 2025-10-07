@@ -1,6 +1,8 @@
 cancel = false
 simulating = false
 counter = 0
+shutdown = false  # Add shutdown flag
+server_ref = Ref{Any}()  # Store server reference
 
 function start!(;host = "127.0.0.1", port = 2000)
     #start server
@@ -8,11 +10,19 @@ function start!(;host = "127.0.0.1", port = 2000)
     println("###############SERVER OPENED###################")
     println("###############################################")
 
+    global shutdown = false
+
     ## PERSISTENT LOOP
-    WebSockets.listen!(host, port) do ws
+    server = WebSockets.listen!(host, port) do ws
         # FOR EACH MESSAGE SENT FROM CLIENT
         
         for msg in ws
+            # Check shutdown flag
+            if shutdown
+                println("Server shutting down...")
+                break
+            end
+
             try
             @async readMSG(msg, ws)
             catch error
@@ -20,6 +30,10 @@ function start!(;host = "127.0.0.1", port = 2000)
             end
         end
     end
+
+    # Store server reference for shutdown
+    server_ref[] = server
+    return server
 end
 
 function readMSG(msg, ws)
@@ -46,7 +60,8 @@ function readMSG(msg, ws)
         # ANALYSIS
         try
             # DESERIALIZE MESSAGE
-            problem = JSON.parse(msg)
+            problem = J3.read(msg)
+            println(J3.pretty(problem))
 
             # MAIN ALGORITHM
             println("READING DATA")
@@ -75,3 +90,25 @@ function readMSG(msg, ws)
         global counter += 1
         println("Counter $counter")
 end
+
+# Add shutdown function
+function shutdown_server!()
+    println("Initiating server shutdown...")
+    global shutdown = true
+    
+    # Close the server if it exists
+    if isassigned(server_ref) && server_ref[] !== nothing
+        try
+            close(server_ref[])
+            println("Server closed successfully")
+        catch e
+            println("Error closing server: $e")
+        end
+    end
+    
+    # Reset flags
+    global cancel = false
+    global simulating = false
+    global counter = 0
+end
+
