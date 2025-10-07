@@ -83,7 +83,7 @@ function readMSG(msg, ws)
 end
 
 # Add shutdown function
-function kill!()
+function shutdown_server!()
     println("Initiating server shutdown...")
     global shutdown = true
     

@@ -26,6 +26,6 @@ include("adjoint.jl")
 include("anchors.jl")
 include("utils.jl")
 
-export start!, kill!
+export start!, shutdown_server!
 
 end # module FDMremote
