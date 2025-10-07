@@ -25,7 +25,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                     "Z" => xyz[:,3],
                     "Losstrace" => [0.])
 
-            HTTP.WebSockets.send(ws, J3.write(msgout))
+            HTTP.WebSockets.send(ws, JSON3.write(msgout))
             
         else
 
@@ -130,7 +130,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                                 "Y" => xyzfull[:,2], 
                                 "Z" => xyzfull[:,3],
                                 "Losstrace" => losses)
-                            HTTP.WebSockets.send(ws, J3.write(msgout))
+                            HTTP.WebSockets.send(ws, JSON3.write(msgout))
                         end
                     end
                     i += 1
@@ -211,7 +211,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                 "NodeTrace" => NodeTrace)
 
 
-        HTTP.WebSockets.send(ws, J3.write(msgout))
+        HTTP.WebSockets.send(ws, JSON3.write(msgout))
 
 
     end

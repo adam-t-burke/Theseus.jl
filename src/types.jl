@@ -4,7 +4,7 @@ struct Objective
     Indices::Union{Vector{Int64}, Int64}
     Values::Union{Vector{Float64}, Matrix{Float64}, Float64, Nothing}
 
-    function Objective(obj::J3.Object, ne::Int64, nn::Int64, N, F)
+    function Objective(obj::JSON3.Object, ne::Int64, nn::Int64, N, F)
         id = obj.OBJID
         w = Float64(obj.Weight)
 
@@ -70,12 +70,12 @@ struct Parameters
 
     NodeTrace::Bool
 
-    function Objectives(objs::J3.Array, ne, nn, N, F)
+    function Objectives(objs::JSON3.Array, ne, nn, N, F)
         objectives = [Objective(obj, ne, nn, N, F) for obj in objs]
         return objectives
     end
 
-    function Parameters(parameters::J3.Object, ne::Int64, nn::Int64, N::Vector{Int64}, F::Vector{Int64})
+    function Parameters(parameters::JSON3.Object, ne::Int64, nn::Int64, N::Vector{Int64}, F::Vector{Int64})
         objectives = Objectives(parameters.Objectives, ne, nn, N, F)
         abstol = Float64(parameters.AbsTol)
         reltol = Float64(parameters.RelTol)
@@ -151,7 +151,7 @@ struct Receiver
 
 
     #constructor
-    function Receiver(problem::J3.Object)
+    function Receiver(problem::JSON3.Object)
         #anchor geometry
         xyzf = problem.XYZf
         xyzf = reduce(hcat, xyzf)
