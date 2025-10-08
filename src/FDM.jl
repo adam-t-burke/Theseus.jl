@@ -15,6 +15,9 @@ function solve_explicit(
     )
 
     Q = sparse(sp_init,sp_init,q) # build diagonal force density Matrix
+
+    Qcn = 
+    Qcf = 
     
     return (Cn' * Q * Cn) \ (Pn - Cn' * Q * Cf * Nf)
 end
