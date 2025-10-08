@@ -74,7 +74,7 @@ DI.gradient!(
 result = optimize(
     q -> obj(q, Cn, Cf, Pn, Nf, target_xyz),  # objective as closure
     [2.0, 2.0],                              # initial guess
-    BFGS()
+    LBFGS()
 )
 
 println("Optimal qvec: ", Optim.minimizer(result))
