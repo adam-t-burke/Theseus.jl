@@ -75,7 +75,7 @@ struct Parameters
         return objectives
     end
 
-    function Parameters(parameters::Dict, ne::Int64, nn::Int64, N::Vector{Int64}, F::Vector{Int64})
+    function Parameters(parameters::JSON3.Object, ne::Int64, nn::Int64, N::Vector{Int64}, F::Vector{Int64})
         objectives = Objectives(parameters["Objectives"], ne, nn, N, F)
         abstol = Float64(parameters["AbsTol"])
         reltol = Float64(parameters["RelTol"])
