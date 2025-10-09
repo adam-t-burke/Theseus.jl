@@ -13,7 +13,7 @@ function solve_explicit(
     Nf::Matrix{Float64}, #Matrix of fixed node positions
     )
 
-    # Scale columns of Cn and Cf by qvec
+    # Scale columns of Cn and Cf by q
     Cnq = Cn .* q
     Cfq = Cf .* q
 
