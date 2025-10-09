@@ -46,7 +46,7 @@ function readMSG(msg, ws)
         # ANALYSIS
         try
             # DESERIALIZE MESSAGE
-            problem = JSON.parse(msg)
+            problem = JSON3.read(msg)
 
             # MAIN ALGORITHM
             println("READING DATA")

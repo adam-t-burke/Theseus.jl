@@ -11,11 +11,13 @@ function solve_explicit(
     Cf::SparseMatrixCSC{Int64,Int64}, #Index matrix of fixed nodes
     Pn::Matrix{Float64}, #Matrix of free node loads
     Nf::Matrix{Float64}, #Matrix of fixed node positions
-    sp_init::Vector{Int64} #Intialization for sparse matrix
     )
 
-    Q = sparse(sp_init,sp_init,q) # build diagonal force density Matrix
-    
-    return (Cn' * Q * Cn) \ (Pn - Cn' * Q * Cf * Nf)
+    # Scale columns of Cn and Cf by q
+    Cnq = Cn .* q
+    Cfq = Cf .* q
+
+    # Compute result using scaled matrices
+    return (Cn' * Cnq) \ (Pn - Cn' * Cfq * Nf)
 end
 

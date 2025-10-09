@@ -6,7 +6,7 @@ using SparseArrays
 using Optim
 using Zygote
 using Zygote: @adjoint
-using JSON
+using JSON3
 using HTTP
 using LineSearches
 using ChainRulesCore

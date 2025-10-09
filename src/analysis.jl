@@ -3,14 +3,12 @@ import HTTP.WebSockets
 ### optimiztaion
 function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
 
-        sp_init = collect(Int64, range(1, length = receiver.ne))
-
         # objective function
         if isnothing(receiver.Params) || isnothing(receiver.Params.Objectives) || isempty(receiver.Params.Objectives)
 
             println("SOLVING")
 
-            xyznew = solve_explicit(receiver.Q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf, sp_init)
+            xyznew = solve_explicit(receiver.Q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf)
 
             xyz = zeros(receiver.nn, 3)
             xyz[receiver.N, :] = xyznew
@@ -25,7 +23,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                     "Z" => xyz[:,3],
                     "Losstrace" => [0.])
 
-            HTTP.WebSockets.send(ws, json(msgout))
+            HTTP.WebSockets.send(ws, JSON3.write(msgout))
             
         else
             try
@@ -52,7 +50,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
 
                 xyzf = combineSorted(newXYZf, oldXYZf, receiver.AnchorParams.VAI, receiver.AnchorParams.FAI)
 
-                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, xyzf, sp_init)
+                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, xyzf)
 
                 xyzfull = vcat(xyznew, xyzf)
                 
@@ -77,7 +75,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             function obj(q)
                 #q = clamp.(q, receiver.Params.LB, receiver.Params.UB)           
 
-                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf, sp_init)
+                xyznew = solve_explicit(q, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf)
                 
                 xyzfull = vcat(xyznew, receiver.XYZf)  
                 
@@ -130,7 +128,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                                 "Y" => xyzfull[:,2], 
                                 "Z" => xyzfull[:,3],
                                 "Losstrace" => losses)
-                            HTTP.WebSockets.send(ws, json(msgout))
+                            HTTP.WebSockets.send(ws, JSON3.write(msgout))
                         end
                     end
                     i += 1
@@ -190,13 +188,13 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
             println("SOLUTION FOUND")
             # PARSING SOLUTION
             if isnothing(receiver.AnchorParams)
-                xyz_final = solve_explicit(min, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf, sp_init)
+                xyz_final = solve_explicit(min, receiver.Cn, receiver.Cf, receiver.Pn, receiver.XYZf)
                 xyz_final = vcat(xyz_final, receiver.XYZf)
             else
                 newXYZf = reshape(min[receiver.ne+1:end], (:, 3))
                 oldXYZf = receiver.XYZf[receiver.AnchorParams.FAI, :]
                 XYZf_final = combineSorted(newXYZf, oldXYZf, receiver.AnchorParams.VAI, receiver.AnchorParams.FAI)
-                xyz_final = solve_explicit(min[1:receiver.ne], receiver.Cn, receiver.Cf, receiver.Pn, XYZf_final, sp_init)
+                xyz_final = solve_explicit(min[1:receiver.ne], receiver.Cn, receiver.Cf, receiver.Pn, XYZf_final)
                 xyz_final = vcat(xyz_final, XYZf_final)
             end
 
@@ -212,7 +210,7 @@ function FDMoptim!(receiver, ws; max_norm::Float64=1.0)
                 "NodeTrace" => NodeTrace)
 
 
-        HTTP.WebSockets.send(ws, json(msgout))
+        HTTP.WebSockets.send(ws, JSON3.write(msgout))
 
         catch error
             println(error)
