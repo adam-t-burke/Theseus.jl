@@ -1,0 +1,28 @@
+name: docs
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.11'
+
+      - name: Build docs (runs make.jl which creates/activates/instantiates docs env)
+        run: julia --project=docs docs/make.jl
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          publish_dir: ./docs/build
+          publish_branch: gh-pages
+          github_token: ${{ secrets.GITHUB_TOKEN }}
