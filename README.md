@@ -1,4 +1,4 @@
-[![Docs](https://img.shields.io/badge/docs-stable-blue.svg)](https://adam-t-burke.github.io/Theseus.jl/)
+[![Docs](https://img.shields.io/badge/docs-stable-blue.svg)](https://adam-t-burke.github.io/Theseus.jl/docs/build)
 # Theseus
 
 Theseus is a [Julia](https://julialang.org/) package for form-finding and optimization of tensile structures, compression structures, and mixed tension/compression structures. It is a companion package to [Ariadne](https://github.com/fibrous-tendencies/Ariadne). Theseus starts a local server and can communicate with Ariadne via WebSockets.
