@@ -1,262 +1,402 @@
-struct Objective
-    ID::Int64
-    W::Float64
-    Indices::Union{Vector{Int64}, Int64}
-    Values::Union{Vector{Float64}, Matrix{Float64}, Float64, Nothing}
+using JSON3
+using SparseArrays
 
-    function Objective(obj::JSON3.Object, ne::Int64, nn::Int64, N, F)
-        id = obj["OBJID"]
-        w = Float64(obj["Weight"])
+const DEFAULT_BARRIER_SHARPNESS = 10.0
 
-        #If the objective is a global objective, then the indices are -1
-        if  obj["Indices"][1] == -1
-            if id == 1
-                indices = N
-            elseif id == 0
-                indices = F
-            else
-                indices = collect(Int64, range(1, ne))
-            end        
-        else
-            indices = Int64.(obj["Indices"]) .+ 1
-        end
+abstract type AbstractObjective end
 
-        #Vector form of values
-        if haskey(obj, "Values")
-            if obj["Indices"][1] == -1
-                values = ones(ne) .* Float64.(obj["Values"])
-            elseif length(obj["Values"]) == length(obj["Indices"])
-                values = Float64.(obj["Values"])
-            elseif length(obj["Values"]) == 1 && length(obj["Indices"]) > 1
-                values = ones(length(obj["Indices"])) .* Float64.(obj["Values"][1])
-            else
-                println("Warning: Number of values must match number of indices or be 1.")
-                println("Using first value for all values.")
-                values = ones(ne) .* Float64.(obj["Values"][1])
-            end
-        
-        #Matrix form of values. All point based objectives have more than one value and 
-        #typically not repeated values, so we assume that the values are given.
-        elseif haskey(obj, "Points")
-            values = obj["Points"]
-            values = reduce(hcat, values)
-            values = convert(Matrix{Float64}, values')
-        
-            
-        #Some objectives don't have values.
-        else
-                values = nothing
-        end
-
-
-        new(id, w, indices, values)
-    end        
+Base.@kwdef struct TargetXYZObjective <: AbstractObjective
+    weight::Float64
+    node_indices::Vector{Int}
+    target::Matrix{Float64}
 end
 
-struct Parameters
-    #OBJECTIVES
-    Objectives::Vector{Objective}
+Base.@kwdef struct TargetXYObjective <: AbstractObjective
+    weight::Float64
+    node_indices::Vector{Int}
+    target::Matrix{Float64}
+end
 
-    #PARAMETERS
-    AbsTol::Float64
-    RelTol::Float64
-    Freq::Int64
-    MaxIter::Int64
-    Show::Bool
+Base.@kwdef struct TargetLengthObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+    target::Vector{Float64}
+end
 
-    #DERIVED VALUES
-    UB::Vector{Float64}
-    LB::Vector{Float64}
+Base.@kwdef struct LengthVariationObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+end
 
-    NodeTrace::Bool
+Base.@kwdef struct ForceVariationObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+end
 
-    function Objectives(objs::JSON3.Array, ne, nn, N, F)
-        objectives = [Objective(obj, ne, nn, N, F) for obj in objs]
-        return objectives
+Base.@kwdef struct SumForceLengthObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+end
+
+Base.@kwdef struct MinLengthObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+    threshold::Vector{Float64}
+    sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
+end
+
+Base.@kwdef struct MaxLengthObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+    threshold::Vector{Float64}
+    sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
+end
+
+Base.@kwdef struct MinForceObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+    threshold::Vector{Float64}
+    sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
+end
+
+Base.@kwdef struct MaxForceObjective <: AbstractObjective
+    weight::Float64
+    edge_indices::Vector{Int}
+    threshold::Vector{Float64}
+    sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
+end
+
+Base.@kwdef struct RigidSetCompareObjective <: AbstractObjective
+    weight::Float64
+    node_indices::Vector{Int}
+    target::Matrix{Float64}
+end
+
+struct Bounds
+    lower::Vector{Float64}
+    upper::Vector{Float64}
+end
+
+struct SolverOptions
+    absolute_tolerance::Float64
+    relative_tolerance::Float64
+    max_iterations::Int
+    report_frequency::Int
+    show_progress::Bool
+end
+
+struct TracingOptions
+    record_nodes::Bool
+    emit_frequency::Int
+end
+
+struct OptimizationParameters
+    objectives::Vector{AbstractObjective}
+    bounds::Bounds
+    solver::SolverOptions
+    tracing::TracingOptions
+end
+
+struct NetworkTopology
+    incidence::SparseMatrixCSC{Int, Int}
+    free_incidence::SparseMatrixCSC{Int, Int}
+    fixed_incidence::SparseMatrixCSC{Int, Int}
+    num_edges::Int
+    num_nodes::Int
+    free_node_indices::Vector{Int}
+    fixed_node_indices::Vector{Int}
+end
+
+struct LoadData
+    free_node_loads::Matrix{Float64}
+end
+
+struct GeometryData
+    fixed_node_positions::Matrix{Float64}
+end
+
+Base.@kwdef struct AnchorInfo
+    variable_indices::Vector{Int}
+    fixed_indices::Vector{Int}
+    reference_positions::Matrix{Float64}
+    initial_variable_positions::Matrix{Float64}
+end
+
+AnchorInfo(reference_positions::Matrix{Float64}) = AnchorInfo(Int[], collect(1:size(reference_positions, 1)), reference_positions, zeros(0, 3))
+
+struct OptimizationProblem
+    topology::NetworkTopology
+    loads::LoadData
+    geometry::GeometryData
+    anchors::AnchorInfo
+    parameters::OptimizationParameters
+end
+
+mutable struct OptimizationState
+    force_densities::Vector{Float64}
+    variable_anchor_positions::Matrix{Float64}
+    loss_trace::Vector{Float64}
+    node_trace::Vector{Matrix{Float64}}
+    iterations::Int
+end
+
+OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Matrix{Float64}[], 0)
+
+struct ObjectiveContext
+    num_edges::Int
+    num_nodes::Int
+    free_node_indices::Vector{Int}
+    fixed_node_indices::Vector{Int}
+end
+
+default_bounds(ne::Int) = Bounds(fill(-Inf, ne), fill(Inf, ne))
+
+function current_fixed_positions(problem::OptimizationProblem, anchor_positions::Matrix{Float64})
+    anchor = problem.anchors
+    if isempty(anchor.variable_indices)
+        return anchor.reference_positions
     end
+    positions = copy(anchor.reference_positions)
+    positions[anchor.variable_indices, :] .= anchor_positions
+    return positions
+end
 
-    function Parameters(parameters::JSON3.Object, ne::Int64, nn::Int64, N::Vector{Int64}, F::Vector{Int64})
-        objectives = Objectives(parameters["Objectives"], ne, nn, N, F)
-        abstol = Float64(parameters["AbsTol"])
-        reltol = Float64(parameters["RelTol"])
-        freq = Int64(parameters["UpdateFrequency"])
-        maxiter = Int64(parameters["MaxIterations"])
-        show = Bool(parameters["ShowIterations"])
+current_fixed_positions(problem::OptimizationProblem, state::OptimizationState) =
+    current_fixed_positions(problem, state.variable_anchor_positions)
 
-        ub = Float64.(parameters["UpperBound"])
-        lb = Float64.(parameters["LowerBound"])
+function objective_context(problem::OptimizationProblem)
+    topo = problem.topology
+    ObjectiveContext(topo.num_edges, topo.num_nodes, topo.free_node_indices, topo.fixed_node_indices)
+end
 
-        nodeTrace = parameters["NodeTrace"]
-
-        return new(
-            objectives,
-            abstol,
-            reltol,
-            freq,
-            maxiter,
-            show,
-            ub,
-            lb,
-            nodeTrace)
+function parse_indices(obj_json, ctx::ObjectiveContext, objective_id::Int)
+    if haskey(obj_json, "Indices")
+        raw_indices = obj_json["Indices"]
+        if !isempty(raw_indices) && raw_indices[1] == -1
+            if objective_id == 1
+                return copy(ctx.free_node_indices)
+            elseif objective_id == 0
+                return copy(ctx.fixed_node_indices)
+            else
+                return collect(1:ctx.num_edges)
+            end
+        else
+            return Int.(raw_indices) .+ 1
+        end
+    else
+        return collect(1:ctx.num_edges)
     end
 end
 
-struct AnchorParameters
-    VAI::Vector{Int64}
-    FAI::Vector{Int64}
+function parse_target_matrix(obj_json)
+    values = haskey(obj_json, "Values") ? obj_json["Values"] : obj_json["Points"]
+    matrix = reduce(hcat, values)
+    convert(Matrix{Float64}, matrix')
+end
 
-    Init::Vector{Float64}
-
-    function AnchorParameters(anchors::Vector{Any}, var::Vector{Any}, fix::Vector{Any})
-        variableAnchors = Int64.(var) .+ 1
-        fixedAnchors = Int64.(fix) .+ 1
-
-        init = []
-
-        for anchor in anchors
-            push!(init, anchor["InitialX"])
-            push!(init, anchor["InitialY"])
-            push!(init, anchor["InitialZ"])
-        end
-
-        return new(
-            variableAnchors,
-            fixedAnchors,
-            init)
+function parse_value_vector(obj_json, indices::Vector{Int}, ctx_length::Int)
+    haskey(obj_json, "Values") || error("Objective is missing value data")
+    values = Float64.(obj_json["Values"])
+    if length(values) == length(indices)
+        return values
+    elseif length(values) == 1
+        return fill(values[1], length(indices))
+    elseif length(values) == ctx_length
+        return values
+    else
+        return fill(values[1], length(indices))
     end
 end
 
-struct Receiver
-
-    #FORCE DENSITY
-    Q::Vector{Float64}
-
-    #NETWORK INFORMATION
-    N::Vector{Int64}
-    F::Vector{Int64}
-
-    XYZf::Matrix{Float64}
-    Pn::Matrix{Float64}
-
-    C::SparseMatrixCSC{Int64, Int64}
-    Cn::SparseMatrixCSC{Int64, Int64}
-    Cf::SparseMatrixCSC{Int64, Int64}
-
-    ne::Int64
-    nn::Int64
-
-    Params::Union{Parameters, Nothing}
-    
-    AnchorParams::Union{AnchorParameters, Nothing}
-
-
-    #constructor
-    function Receiver(problem::JSON3.Object)
-        #anchor geometry
-        xyzf = problem["XYZf"]
-        xyzf = reduce(hcat, xyzf)
-        xyzf = convert(Matrix{Float64}, xyzf')
-
-        # global info
-        ne = Int(problem["Network"]["Graph"]["Ne"])
-        nn = Int(problem["Network"]["Graph"]["Nn"])
-
-        # initial force densities
-        if length(problem["Q"]) == 1
-            q = Float64.(repeat(problem["Q"], ne))
-        elseif length(problem["Q"]) == ne
-            q = Float64.(problem["Q"])
-        else
-            q = repeat(1.0, ne)
-        end        
-
-        # free/fixed
-        N = Int.(problem["Network"]["FreeNodes"]) .+ 1
-        N = collect(range(1, length = length(N)))
-        F = Int.(problem["Network"]["FixedNodes"]) .+ 1 
-        F = collect(range(length(N)+1, length = length(F)))   
-
-        # loads
-        GH_p = problem["P"]
-        GH_p = reduce(hcat, GH_p)
-        GH_p = convert(Matrix{Float64}, GH_p')
-
-        LN = Int[]
-        # load nodes
-        if haskey(problem, "LoadNodes")
-            LN = Int.(problem["LoadNodes"]) .+ 1     
-            #If the number of given load vectors matches the number of 
-            #node indices given in the problem, then we assume that the
-            #load vectors are given in the same order as the node indices.
-            if length(LN) == size(GH_p, 1)
-                p = zeros(nn, 3)
-                p[LN, :] = GH_p
-            elseif length(LN) > 1 && size(GH_p, 1) == 1         
-                p = zeros(nn, 3)
-                p[LN, :] = repeat(GH_p, length(LN))
-            else
-                p = zeros(nn, 3)
-                println("Warning: Number of load vectors must match number of load nodes or be 1.")
-                println("Using zero loads.")
-            end
-            Pn = p[N, :]
-        else
-            if size(GH_p, 1) == 1
-                p = repeat(GH_p, length(N))
-            elseif size(GH_p, 1) == length(N)
-                p = GH_p
-            else
-                println("Warning: Number of load vectors must match number of load nodes or be 1.")
-                println("Using zero loads.")
-                p = zeros(length(N), 3)
-            end
-            Pn = p      
-        end
-
-        # connectivity
-        i = Int.(problem["I"]) .+ 1
-        j = Int.(problem["J"]) .+ 1
-        v = Int.(problem["V"])
-
-        C = sparse(i, j, v, ne, nn)
-        Cn = C[:, 1:length(N)]
-        Cf = C[:, length(N)+1:end]
-
-        if haskey(problem, "Parameters")
-            p = Parameters(problem["Parameters"], ne, nn, N, F)
-
-            #prevent the force densities from being outside the bounds
-            q = clamp(q, p.LB, p.UB)
-        else
-            println("No optimization parameters provided.")
-            println("Running FDM using given force densities only.")
-            p = nothing
-        end
-
-        if haskey(problem, "VariableAnchors")
-            varAnchors = problem["NodeIndex"]
-            fixAnchors = problem["FixedAnchorIndices"]
-            ap = AnchorParameters(problem["VariableAnchors"], varAnchors, fixAnchors)
-        else
-            println("No anchor parameters provided.")
-            println("Using only given fixed node positions.")
-            ap = nothing
-        end
-
-        
-
-        return new(
-            q, 
-            N, 
-            F,
-            xyzf, 
-            Pn,
-            C,
-            Cn,
-            Cf,
-            ne,
-            nn,
-            p,
-            ap)        
+function build_objective(obj_json::JSON3.Object, ctx::ObjectiveContext)
+    id = Int(obj_json["OBJID"])
+    weight = Float64(obj_json["Weight"])
+    indices = parse_indices(obj_json, ctx, id)
+    if id == -1
+        return nothing
+    elseif id == 1
+        target = parse_target_matrix(obj_json)
+        return TargetXYZObjective(weight=weight, node_indices=indices, target=target)
+    elseif id == 2
+        return LengthVariationObjective(weight=weight, edge_indices=indices)
+    elseif id == 3
+        return ForceVariationObjective(weight=weight, edge_indices=indices)
+    elseif id == 4
+        return SumForceLengthObjective(weight=weight, edge_indices=indices)
+    elseif id == 5
+        values = parse_value_vector(obj_json, indices, ctx.num_edges)
+        return MinLengthObjective(weight=weight, edge_indices=indices, threshold=values)
+    elseif id == 6
+        values = parse_value_vector(obj_json, indices, ctx.num_edges)
+        return MaxLengthObjective(weight=weight, edge_indices=indices, threshold=values)
+    elseif id == 7
+        values = parse_value_vector(obj_json, indices, ctx.num_edges)
+        return MinForceObjective(weight=weight, edge_indices=indices, threshold=values)
+    elseif id == 8
+        values = parse_value_vector(obj_json, indices, ctx.num_edges)
+        return MaxForceObjective(weight=weight, edge_indices=indices, threshold=values)
+    elseif id == 9
+        values = parse_value_vector(obj_json, indices, ctx.num_edges)
+        return TargetLengthObjective(weight=weight, edge_indices=indices, target=values)
+    elseif id == 10
+        target = parse_target_matrix(obj_json)
+        return TargetXYObjective(weight=weight, node_indices=indices, target=target)
+    elseif id == 11
+        target = parse_target_matrix(obj_json)
+        return RigidSetCompareObjective(weight=weight, node_indices=indices, target=target)
+    else
+        error("Unsupported objective identifier: $id")
     end
+end
+
+function build_objectives(objectives_json, ctx::ObjectiveContext)
+    objectives = AbstractObjective[]
+    for entry in objectives_json
+        candidate = build_objective(entry, ctx)
+        if candidate !== nothing
+            push!(objectives, candidate)
+        end
+    end
+    return objectives
+end
+
+function parse_bounds(parameters_json::JSON3.Object, num_edges::Int)
+    lower = haskey(parameters_json, "LowerBound") ? Float64.(parameters_json["LowerBound"]) : fill(-Inf, num_edges)
+    upper = haskey(parameters_json, "UpperBound") ? Float64.(parameters_json["UpperBound"]) : fill(Inf, num_edges)
+    if length(lower) == 1
+        lower = fill(lower[1], num_edges)
+    end
+    if length(upper) == 1
+        upper = fill(upper[1], num_edges)
+    end
+    Bounds(lower, upper)
+end
+
+function parse_solver_options(parameters_json::JSON3.Object)
+    abs_tol = haskey(parameters_json, "AbsTol") ? Float64(parameters_json["AbsTol"]) : 1e-6
+    rel_tol = haskey(parameters_json, "RelTol") ? Float64(parameters_json["RelTol"]) : 1e-6
+    max_iter = haskey(parameters_json, "MaxIterations") ? Int(parameters_json["MaxIterations"]) : 500
+    freq = haskey(parameters_json, "UpdateFrequency") ? Int(parameters_json["UpdateFrequency"]) : 1
+    show = haskey(parameters_json, "ShowIterations") ? Bool(parameters_json["ShowIterations"]) : false
+    SolverOptions(abs_tol, rel_tol, max_iter, freq, show)
+end
+
+function parse_tracing_options(parameters_json::JSON3.Object)
+    record_nodes = haskey(parameters_json, "NodeTrace") ? Bool(parameters_json["NodeTrace"]) : false
+    freq = haskey(parameters_json, "UpdateFrequency") ? Int(parameters_json["UpdateFrequency"]) : 1
+    TracingOptions(record_nodes, freq)
+end
+
+function parse_anchor_info(problem::JSON3.Object, fixed_positions::Matrix{Float64})
+    if !haskey(problem, "VariableAnchors")
+        return AnchorInfo(fixed_positions)
+    end
+
+    anchors = problem["VariableAnchors"]
+    variable_indices = haskey(problem, "NodeIndex") ? Int.(problem["NodeIndex"]) .+ 1 : Int[]
+    fixed_indices = haskey(problem, "FixedAnchorIndices") ? Int.(problem["FixedAnchorIndices"]) .+ 1 : setdiff(collect(1:size(fixed_positions, 1)), variable_indices)
+
+    init_positions = Matrix{Float64}(undef, length(variable_indices), 3)
+    for (row, anchor) in enumerate(anchors)
+        init_positions[row, 1] = Float64(anchor["InitialX"])
+        init_positions[row, 2] = Float64(anchor["InitialY"])
+        init_positions[row, 3] = Float64(anchor["InitialZ"])
+    end
+
+    AnchorInfo(variable_indices=variable_indices, fixed_indices=fixed_indices, reference_positions=fixed_positions, initial_variable_positions=init_positions)
+end
+
+function normalize_force_densities(values::Vector{Float64}, num_edges::Int)
+    if length(values) == 1
+        return fill(values[1], num_edges)
+    elseif length(values) == num_edges
+        return values
+    else
+        return fill(1.0, num_edges)
+    end
+end
+
+function build_topology(problem::JSON3.Object)
+    ne = Int(problem["Network"]["Graph"]["Ne"])
+    nn = Int(problem["Network"]["Graph"]["Nn"])
+
+    free_nodes = collect(1:length(problem["Network"]["FreeNodes"]))
+    fixed_nodes = collect(length(free_nodes) + 1:length(free_nodes) + length(problem["Network"]["FixedNodes"]))
+
+    i = Int.(problem["I"]) .+ 1
+    j = Int.(problem["J"]) .+ 1
+    v = Int.(problem["V"])
+
+    incidence = sparse(i, j, v, ne, nn)
+    free_incidence = incidence[:, 1:length(free_nodes)]
+    fixed_incidence = incidence[:, length(free_nodes) + 1:end]
+
+    NetworkTopology(incidence, free_incidence, fixed_incidence, ne, nn, free_nodes, fixed_nodes)
+end
+
+function build_geometry(problem::JSON3.Object)
+    matrix = reduce(hcat, problem["XYZf"])
+    GeometryData(convert(Matrix{Float64}, matrix'))
+end
+
+function build_loads(problem::JSON3.Object, topo::NetworkTopology)
+    loads_matrix = reduce(hcat, problem["P"])
+    loads = convert(Matrix{Float64}, loads_matrix')
+
+    full_loads = zeros(topo.num_nodes, 3)
+    load_nodes = haskey(problem, "LoadNodes") ? Int.(problem["LoadNodes"]) .+ 1 : Int[]
+
+    if !isempty(load_nodes)
+        if length(load_nodes) == size(loads, 1)
+            full_loads[load_nodes, :] .= loads
+        elseif size(loads, 1) == 1
+            for node in load_nodes
+                full_loads[node, :] .= loads[1, :]
+            end
+        end
+    else
+        if size(loads, 1) == 1
+            for node in topo.free_node_indices
+                full_loads[node, :] .= loads[1, :]
+            end
+        elseif size(loads, 1) == length(topo.free_node_indices)
+            for (row, node) in enumerate(topo.free_node_indices)
+                full_loads[node, :] .= loads[row, :]
+            end
+        end
+    end
+
+    LoadData(full_loads[topo.free_node_indices, :])
+end
+
+function build_parameters(problem::JSON3.Object, topo::NetworkTopology)
+    if !haskey(problem, "Parameters")
+        return OptimizationParameters(AbstractObjective[], default_bounds(topo.num_edges), SolverOptions(1e-6, 1e-6, 1, 1, false), TracingOptions(false, 1))
+    end
+
+    params_json = problem["Parameters"]
+    ctx = ObjectiveContext(topo.num_edges, topo.num_nodes, topo.free_node_indices, topo.fixed_node_indices)
+    objectives = haskey(params_json, "Objectives") ? build_objectives(params_json["Objectives"], ctx) : AbstractObjective[]
+    bounds = parse_bounds(params_json, topo.num_edges)
+    solver = parse_solver_options(params_json)
+    tracing = parse_tracing_options(params_json)
+
+    OptimizationParameters(objectives, bounds, solver, tracing)
+end
+
+function build_problem(problem::JSON3.Object)
+    topo = build_topology(problem)
+    geometry = build_geometry(problem)
+    loads = build_loads(problem, topo)
+
+    anchors = parse_anchor_info(problem, geometry.fixed_node_positions)
+    parameters = build_parameters(problem, topo)
+
+    q_values = normalize_force_densities(Float64.(problem["Q"]), topo.num_edges)
+    q_init = clamp.(q_values, parameters.bounds.lower, parameters.bounds.upper)
+
+    problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
+    state = OptimizationState(q_init, anchors.initial_variable_positions)
+
+    problem_struct, state
 end
