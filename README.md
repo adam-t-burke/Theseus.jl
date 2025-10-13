@@ -24,7 +24,7 @@ Press enter to execute this command. This will create a new environment with the
 To actually install the package type:
 
 ```julia
-add https://github.com/fibrous-tendencies/Theseus.jl
+add https://github.com/adam-t-burke/Theseus.jl
 ```
 
 Press enter to execute this command. Once all of the dependencies have been installed you can press backspace to exit pkg mode. The word julia should reappear.
