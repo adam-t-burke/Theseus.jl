@@ -1,12 +1,13 @@
+import HTTP.WebSockets
+using Logging
+
 cancel = false
 simulating = false
 counter = 0
 
 function start!(;host = "127.0.0.1", port = 2000)
     #start server
-    println("###############################################")
-    println("###############SERVER OPENED###################")
-    println("###############################################")
+    @info "Theseus server listening" host port
 
     ## PERSISTENT LOOP
     WebSockets.listen!(host, port) do ws
@@ -14,64 +15,60 @@ function start!(;host = "127.0.0.1", port = 2000)
         
         for msg in ws
             try
-            @async readMSG(msg, ws)
+                @async readMSG(msg, ws)
             catch error
-                println(error)
+                @error "WebSocket handler failure" exception=(error, catch_backtrace())
             end
         end
     end
 end
 
 function readMSG(msg, ws)
-        # ACKNOWLEDGE
-        println("MSG RECEIVED")
+    # ACKNOWLEDGE
+    @debug "Message received"
 
-        # FIRST MESSAGE
-        if msg == "init"
-            println("CONNECTION INITIALIZED")
-            return
+    # FIRST MESSAGE
+    if msg == "init"
+        @info "Client connection initialized"
+        return
+    end
+
+    if msg == "cancel"
+        @info "Cancellation requested"
+        global cancel = true
+        return
+    end
+
+    if simulating
+        @warn "Simulation already in progress"
+        return
+    end
+
+    # ANALYSIS
+    try
+        problem_json = JSON3.read(msg)
+        problem, state = build_problem(problem_json)
+
+        if isempty(problem.parameters.objectives)
+            @info "Running direct solution"
+        else
+            @info "Running optimization"
         end
 
-        if msg == "cancel"
-            println("Operation Cancelled")
-            global cancel = true
-            return
-        end
-
-        if simulating == true
-            println("Simulation in progress")
-            return
-        end
-
-        # ANALYSIS
-        try
-            # DESERIALIZE MESSAGE
-            problem = JSON3.read(msg)
-
-            # MAIN ALGORITHM
-            println("READING DATA")
-
-            # CONVERT MESSAGE TO RECEIVER TYPE
-            receiver = Receiver(problem)
-
-            # SOLVE
-            if counter == 0
-                println("First run will take a while.")
-                println("Julia needs to compile the code for the first run.")
-            end
-            
-            # OPTIMIZATION
-            global simulating = true
-            @time FDMoptim!(receiver, ws)
-           
-        catch error
-            println("INVALID INPUT")
-            println("CHECK PARAMETER BOUNDS")
-            println(error)
+        if counter == 0
+            @info "Initial compile will add latency"
         end
         
-        println("DONE")
-        global simulating = false
-        global counter += 1
-        println("Counter $counter")
+        # OPTIMIZATION
+        global simulating = true
+        elapsed = @elapsed FDMoptim!(problem, state, ws)
+        @info "Simulation finished" elapsed=elapsed
+       
+    catch error
+        @error "Invalid input" exception=(error, catch_backtrace())
+    end
+
+    global simulating = false
+    global counter += 1
+    @info "Session complete" counter=counter
 end

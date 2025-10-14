@@ -1,41 +1,206 @@
+using LinearAlgebra
+using Optim
+using Zygote
+using ChainRulesCore: ignore_derivatives
+using Logging
 
+struct GeometrySnapshot
+    xyz_free::Matrix{Float64}
+    xyz_fixed::Matrix{Float64}
+    xyz_full::Matrix{Float64}
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+    reactions::Matrix{Float64}
+end
 
-#####
-#Composite loss functions.
-#####
-function lossFunc(xyznew::Matrix{Float64}, lengths::Vector{Float64}, forces::Vector{Float64}, receiver::Receiver, q::Vector{Float64})
+function evaluate_geometry(problem::OptimizationProblem, q::Vector{Float64}, anchor_positions::Matrix{Float64})
+    fixed_positions = current_fixed_positions(problem, anchor_positions)
+    xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
+    xyz_full = vcat(xyz_free, fixed_positions)
+    member_vectors = problem.topology.incidence * xyz_full
+    member_lengths = map(norm, eachrow(member_vectors))
+    member_forces = q .* member_lengths
+    reactions = anchor_reactions(problem.topology, q, xyz_full)
+    GeometrySnapshot(xyz_free, fixed_positions, xyz_full, member_lengths, member_forces, reactions)
+end
+
+function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
+    obj.weight * target_xyz(snapshot.xyz_full, obj.target, obj.node_indices)
+end
+
+function objective_loss(obj::TargetXYObjective, snapshot::GeometrySnapshot)
+    obj.weight * target_xy(snapshot.xyz_full, obj.target, obj.node_indices)
+end
+
+function objective_loss(obj::TargetLengthObjective, snapshot::GeometrySnapshot)
+    obj.weight * lenTarget(snapshot.member_lengths, obj.target, obj.edge_indices)
+end
+
+function objective_loss(obj::LengthVariationObjective, snapshot::GeometrySnapshot)
+    obj.weight * lenVar(snapshot.member_lengths, obj.edge_indices)
+end
+
+function objective_loss(obj::ForceVariationObjective, snapshot::GeometrySnapshot)
+    obj.weight * forceVar(snapshot.member_forces, obj.edge_indices)
+end
+
+function objective_loss(obj::SumForceLengthObjective, snapshot::GeometrySnapshot)
+    edges = obj.edge_indices
+    obj.weight * sum(snapshot.member_lengths[edges] .* snapshot.member_forces[edges])
+end
+
+function objective_loss(obj::MinLengthObjective, snapshot::GeometrySnapshot)
+    obj.weight * minPenalty(snapshot.member_lengths, obj.threshold, obj.edge_indices, obj.sharpness)
+end
+
+function objective_loss(obj::MaxLengthObjective, snapshot::GeometrySnapshot)
+    obj.weight * maxPenalty(snapshot.member_lengths, obj.threshold, obj.edge_indices, obj.sharpness)
+end
+
+function objective_loss(obj::MinForceObjective, snapshot::GeometrySnapshot)
+    obj.weight * minPenalty(snapshot.member_forces, obj.threshold, obj.edge_indices, obj.sharpness)
+end
+
+function objective_loss(obj::MaxForceObjective, snapshot::GeometrySnapshot)
+    obj.weight * maxPenalty(snapshot.member_forces, obj.threshold, obj.edge_indices, obj.sharpness)
+end
+
+function objective_loss(obj::RigidSetCompareObjective, snapshot::GeometrySnapshot)
+    obj.weight * rigidSetCompare(snapshot.xyz_full, obj.node_indices, obj.target)
+end
+
+function objective_loss(obj::ReactionDirectionObjective, snapshot::GeometrySnapshot)
+    obj.weight * reaction_direction_loss(snapshot.reactions, obj)
+end
+
+function objective_loss(obj::ReactionDirectionMagnitudeObjective, snapshot::GeometrySnapshot)
+    obj.weight * reaction_direction_magnitude_loss(snapshot.reactions, obj)
+end
+
+objective_loss(::AbstractObjective, ::GeometrySnapshot) = 0.0
+
+function total_loss(problem::OptimizationProblem, q::Vector{Float64}, anchor_positions::Matrix{Float64}, snapshot::GeometrySnapshot)
     loss = 0.0
-    #Enforce parameter bounds on q restrict the search space to feasible values
-    loss += pBounds(q, receiver.Params.LB, receiver.Params.UB, 10.0, 10.0)
+    for obj in problem.parameters.objectives
+        loss += objective_loss(obj, snapshot)
+    end
+    loss
+end
 
-    #evaluate objective and return composite loss
-    for obj in receiver.Params.Objectives
-        if obj.ID == -1
-            loss += 0.0
-        elseif obj.ID == 1 #Target XYZ
-            loss += obj.W * target_xyz(xyznew, obj.Values, obj.Indices)
-        elseif obj.ID == 2 #Length Variation
-            loss += obj.W * lenVar(lengths, obj.Indices)
-        elseif obj.ID == 3 #Force Variation
-            loss += obj.W * forceVar(lengths, obj.Indices)
-        elseif obj.ID == 4 #∑FL
-            loss += obj.W * dot(lengths, forces)
-        elseif obj.ID == 5 #"MinLength"
-            loss += obj.W * minPenalty(lengths, obj.Values, obj.Indices, 10.0)
-        elseif obj.ID == 6 #"MaxLength"
-            loss += obj.W * maxPenalty(lengths, obj.Values, obj.Indices, 10.0)
-        elseif obj.ID == 7 #"MinForce"
-            loss += obj.W * minPenalty(forces, obj.Values, obj.Indices, 10.0)
-        elseif obj.ID == 8 #"MaxForce"
-            loss += obj.W * maxPenalty(forces, obj.Values, obj.Indices, 10.0)
-        elseif obj.ID == 9 #"TargetLen"
-            loss += obj.W * lenTarget(lengths, obj.Values, obj.Indices)
-        elseif obj.ID == 10 #"TargetXY"
-            loss += obj.W * target_xy(xyznew, obj.Values, obj.Indices)
-        elseif obj.ID == 11 #"RigidSetCompare"
-            loss += obj.W * rigidSetCompare(xyznew, obj.Indices, obj.Values)
+function pack_parameters(problem::OptimizationProblem, state::OptimizationState)
+    if isempty(problem.anchors.variable_indices)
+        return copy(state.force_densities)
+    end
+    vcat(state.force_densities, vec(state.variable_anchor_positions))
+end
+
+function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{<:Real})
+    ne = problem.topology.num_edges
+    q = Float64.(θ[1:ne])
+    nvar = length(problem.anchors.variable_indices)
+    if nvar == 0
+        return q, zeros(Float64, 0, 3)
+    end
+    anchors = reshape(θ[ne + 1:end], 3, nvar)'
+    q, anchors
+end
+
+function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState; on_iteration=nothing)
+    empty!(trace_state.loss_trace)
+    empty!(trace_state.node_trace)
+    trace_state.iterations = 0
+
+    function objective(θ)
+        q, anchors = unpack_parameters(problem, θ)
+        snapshot = evaluate_geometry(problem, q, anchors)
+        loss = total_loss(problem, q, anchors, snapshot)
+        if !isderiving()
+            ignore_derivatives() do
+                trace_state.iterations += 1
+                trace_state.force_densities = copy(q)
+                trace_state.variable_anchor_positions = copy(anchors)
+                push!(trace_state.loss_trace, loss)
+                if problem.parameters.tracing.record_nodes
+                    push!(trace_state.node_trace, copy(snapshot.xyz_full))
+                end
+                if on_iteration !== nothing
+                    on_iteration(trace_state, snapshot, loss)
+                end
+            end
+        end
+        loss
+    end
+
+    objective
+end
+
+function log_lambda_multipliers(min_θ::AbstractVector{<:Real}, grad::AbstractVector{<:Real}, lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real})
+    tol = sqrt(eps(Float64))
+    lower_values = Float64[]
+    upper_values = Float64[]
+    for i in eachindex(min_θ)
+        if isfinite(lower[i]) && min_θ[i] <= lower[i] + tol
+            push!(lower_values, max(0.0, grad[i]))
+        elseif isfinite(upper[i]) && min_θ[i] >= upper[i] - tol
+            push!(upper_values, max(0.0, -grad[i]))
         end
     end
-    
-    return loss
+
+    stats(values) = isempty(values) ? (count=0, max=0.0, sum=0.0) : (count=length(values), max=maximum(values), sum=sum(values))
+    lower_stats = stats(lower_values)
+    upper_stats = stats(upper_values)
+
+    @info "KKT multipliers" lower_active=lower_stats.count upper_active=upper_stats.count max_lower=lower_stats.max max_upper=upper_stats.max sum_lower=lower_stats.sum sum_upper=upper_stats.sum
+    @debug "Lower-bound multipliers" values=lower_values
+    @debug "Upper-bound multipliers" values=upper_values
+end
+
+function parameter_bounds(problem::OptimizationProblem)
+    bounds = problem.parameters.bounds
+    lower = copy(bounds.lower)
+    upper = copy(bounds.upper)
+    nvar = length(problem.anchors.variable_indices)
+    if nvar > 0
+        lower = vcat(lower, fill(-Inf, 3nvar))
+        upper = vcat(upper, fill(Inf, 3nvar))
+    end
+    lower, upper
+end
+
+function make_gradient(objective)
+    function g!(G, θ)
+        grad = gradient(objective, θ)[1]
+        copyto!(G, grad)
+    end
+    g!
+end
+
+function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
+    objective = form_finding_objective(problem, state; on_iteration=on_iteration)
+    gradient! = make_gradient(objective)
+    θ0 = pack_parameters(problem, state)
+    lower_bounds, upper_bounds = parameter_bounds(problem)
+    result = Optim.optimize(
+        objective,
+        gradient!,
+        lower_bounds,
+        upper_bounds,
+        θ0,
+        Fminbox(LBFGS()),
+        Optim.Options(
+            iterations = problem.parameters.solver.max_iterations,
+            f_abstol = problem.parameters.solver.absolute_tolerance,
+            f_reltol = problem.parameters.solver.relative_tolerance,
+        ),
+    )
+
+    min_θ = Optim.minimizer(result)
+    q, anchors = unpack_parameters(problem, min_θ)
+    state.force_densities = copy(q)
+    state.variable_anchor_positions = copy(anchors)
+    snapshot = evaluate_geometry(problem, q, anchors)
+
+    grad_at_solution = gradient(objective, min_θ)[1]
+    log_lambda_multipliers(min_θ, grad_at_solution, lower_bounds, upper_bounds)
+    return result, snapshot
 end
