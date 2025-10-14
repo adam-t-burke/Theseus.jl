@@ -18,7 +18,6 @@ include("analysis.jl")
 include("communication.jl")
 include("objectives.jl")
 include("adjoint.jl")
-include("anchors.jl")
 
 export start!
 

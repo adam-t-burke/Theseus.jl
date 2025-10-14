@@ -1,5 +1,6 @@
 using JSON3
 using SparseArrays
+using LinearAlgebra
 
 const DEFAULT_BARRIER_SHARPNESS = 10.0
 
@@ -70,6 +71,19 @@ Base.@kwdef struct RigidSetCompareObjective <: AbstractObjective
     weight::Float64
     node_indices::Vector{Int}
     target::Matrix{Float64}
+end
+
+Base.@kwdef struct ReactionDirectionObjective <: AbstractObjective
+    weight::Float64
+    anchor_indices::Vector{Int}
+    target_directions::Matrix{Float64}
+end
+
+Base.@kwdef struct ReactionDirectionMagnitudeObjective <: AbstractObjective
+    weight::Float64
+    anchor_indices::Vector{Int}
+    target_directions::Matrix{Float64}
+    target_magnitudes::Vector{Float64}
 end
 
 struct Bounds
@@ -149,7 +163,7 @@ struct ObjectiveContext
     fixed_node_indices::Vector{Int}
 end
 
-default_bounds(ne::Int) = Bounds(fill(-Inf, ne), fill(Inf, ne))
+default_bounds(ne::Int) = Bounds(fill(1e-8, ne), fill(Inf, ne))
 
 function current_fixed_positions(problem::OptimizationProblem, anchor_positions::Matrix{Float64})
     anchor = problem.anchors
@@ -177,6 +191,8 @@ function parse_indices(obj_json, ctx::ObjectiveContext, objective_id::Int)
                 return copy(ctx.free_node_indices)
             elseif objective_id == 0
                 return copy(ctx.fixed_node_indices)
+            elseif objective_id in (12, 13)
+                return copy(ctx.fixed_node_indices)
             else
                 return collect(1:ctx.num_edges)
             end
@@ -194,6 +210,35 @@ function parse_target_matrix(obj_json)
     convert(Matrix{Float64}, matrix')
 end
 
+function parse_direction_targets(obj_json, indices::Vector{Int})
+    haskey(obj_json, "Vectors") || haskey(obj_json, "Points") || error("Objective is missing direction targets")
+    values = haskey(obj_json, "Vectors") ? obj_json["Vectors"] : obj_json["Points"]
+
+    vectors = if length(values) == 1 && length(indices) > 1
+        vec = Float64.(values[1])
+        hcat(ntuple(_ -> copy(vec), length(indices))...)
+    else
+        reduce(hcat, values)
+    end
+
+    matrix = convert(Matrix{Float64}, vectors')
+    size(matrix, 1) == length(indices) || error("Number of direction targets must match indices or be 1")
+    size(matrix, 2) == 3 || error("Direction targets must have exactly three components")
+    println("Parsed direction targets: ", matrix)
+    matrix
+end
+
+function normalize_direction_rows(matrix::Matrix{Float64})
+    normalized = similar(matrix)
+    for row in 1:size(matrix, 1)
+        vec = @view matrix[row, :]
+        mag = norm(vec)
+        mag > eps(Float64) || error("Direction target contains a zero vector")
+        normalized[row, :] .= vec ./ mag
+    end
+    normalized
+end
+
 function parse_value_vector(obj_json, indices::Vector{Int}, ctx_length::Int)
     haskey(obj_json, "Values") || error("Objective is missing value data")
     values = Float64.(obj_json["Values"])
@@ -209,8 +254,8 @@ function parse_value_vector(obj_json, indices::Vector{Int}, ctx_length::Int)
 end
 
 function build_objective(obj_json::JSON3.Object, ctx::ObjectiveContext)
-    id = Int(obj_json["OBJID"])
-    weight = Float64(obj_json["Weight"])
+    id = Int(obj_json.OBJID)
+    weight = Float64(obj_json.Weight)
     indices = parse_indices(obj_json, ctx, id)
     if id == -1
         return nothing
@@ -244,6 +289,21 @@ function build_objective(obj_json::JSON3.Object, ctx::ObjectiveContext)
     elseif id == 11
         target = parse_target_matrix(obj_json)
         return RigidSetCompareObjective(weight=weight, node_indices=indices, target=target)
+    elseif id == 12
+        raw_targets = parse_direction_targets(obj_json, indices)
+        directions = normalize_direction_rows(raw_targets)
+        return ReactionDirectionObjective(weight=weight, anchor_indices=indices, target_directions=directions)
+    elseif id == 13
+        raw_targets = parse_direction_targets(obj_json, indices)
+        directions = normalize_direction_rows(raw_targets)
+        magnitudes = collect(map(norm, eachrow(raw_targets)))
+        all(>(eps(Float64)), magnitudes) || error("Magnitude targets must be non-zero to define a direction")
+        return ReactionDirectionMagnitudeObjective(
+            weight=weight,
+            anchor_indices=indices,
+            target_directions=directions,
+            target_magnitudes=magnitudes,
+        )
     else
         error("Unsupported objective identifier: $id")
     end
@@ -261,7 +321,7 @@ function build_objectives(objectives_json, ctx::ObjectiveContext)
 end
 
 function parse_bounds(parameters_json::JSON3.Object, num_edges::Int)
-    lower = haskey(parameters_json, "LowerBound") ? Float64.(parameters_json["LowerBound"]) : fill(-Inf, num_edges)
+    lower = haskey(parameters_json, "LowerBound") ? Float64.(parameters_json["LowerBound"]) : fill(1e-8, num_edges)
     upper = haskey(parameters_json, "UpperBound") ? Float64.(parameters_json["UpperBound"]) : fill(Inf, num_edges)
     if length(lower) == 1
         lower = fill(lower[1], num_edges)
@@ -306,7 +366,7 @@ function parse_anchor_info(problem::JSON3.Object, fixed_positions::Matrix{Float6
     AnchorInfo(variable_indices=variable_indices, fixed_indices=fixed_indices, reference_positions=fixed_positions, initial_variable_positions=init_positions)
 end
 
-function normalize_force_densities(values::Vector{Float64}, num_edges::Int)
+function build_force_densities(values::Vector{Float64}, num_edges::Int)
     if length(values) == 1
         return fill(values[1], num_edges)
     elseif length(values) == num_edges
@@ -392,7 +452,7 @@ function build_problem(problem::JSON3.Object)
     anchors = parse_anchor_info(problem, geometry.fixed_node_positions)
     parameters = build_parameters(problem, topo)
 
-    q_values = normalize_force_densities(Float64.(problem["Q"]), topo.num_edges)
+    q_values = build_force_densities(Float64.(problem["Q"]), topo.num_edges)
     q_init = clamp.(q_values, parameters.bounds.lower, parameters.bounds.upper)
 
     problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)

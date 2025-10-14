@@ -9,15 +9,8 @@ struct GeometrySnapshot
     xyz_full::Matrix{Float64}
     member_lengths::Vector{Float64}
     member_forces::Vector{Float64}
+    reactions::Matrix{Float64}
 end
-
-bounds_penalty(state_q::Vector{Float64}, bounds::Bounds) = pBounds(
-    state_q,
-    bounds.lower,
-    bounds.upper,
-    DEFAULT_BARRIER_SHARPNESS,
-    DEFAULT_BARRIER_SHARPNESS,
-)
 
 function evaluate_geometry(problem::OptimizationProblem, q::Vector{Float64}, anchor_positions::Matrix{Float64})
     fixed_positions = current_fixed_positions(problem, anchor_positions)
@@ -26,7 +19,8 @@ function evaluate_geometry(problem::OptimizationProblem, q::Vector{Float64}, anc
     member_vectors = problem.topology.incidence * xyz_full
     member_lengths = map(norm, eachrow(member_vectors))
     member_forces = q .* member_lengths
-    GeometrySnapshot(xyz_free, fixed_positions, xyz_full, member_lengths, member_forces)
+    reactions = anchor_reactions(problem.topology, q, xyz_full)
+    GeometrySnapshot(xyz_free, fixed_positions, xyz_full, member_lengths, member_forces, reactions)
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -74,10 +68,18 @@ function objective_loss(obj::RigidSetCompareObjective, snapshot::GeometrySnapsho
     obj.weight * rigidSetCompare(snapshot.xyz_full, obj.node_indices, obj.target)
 end
 
+function objective_loss(obj::ReactionDirectionObjective, snapshot::GeometrySnapshot)
+    obj.weight * reaction_direction_loss(snapshot.reactions, obj)
+end
+
+function objective_loss(obj::ReactionDirectionMagnitudeObjective, snapshot::GeometrySnapshot)
+    obj.weight * reaction_direction_magnitude_loss(snapshot.reactions, obj)
+end
+
 objective_loss(::AbstractObjective, ::GeometrySnapshot) = 0.0
 
 function total_loss(problem::OptimizationProblem, q::Vector{Float64}, anchor_positions::Matrix{Float64}, snapshot::GeometrySnapshot)
-    loss = bounds_penalty(q, problem.parameters.bounds)
+    loss = 0.0
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
     end
@@ -131,6 +133,18 @@ function form_finding_objective(problem::OptimizationProblem, trace_state::Optim
     objective
 end
 
+function parameter_bounds(problem::OptimizationProblem)
+    bounds = problem.parameters.bounds
+    lower = copy(bounds.lower)
+    upper = copy(bounds.upper)
+    nvar = length(problem.anchors.variable_indices)
+    if nvar > 0
+        lower = vcat(lower, fill(-Inf, 3nvar))
+        upper = vcat(upper, fill(Inf, 3nvar))
+    end
+    lower, upper
+end
+
 function make_gradient(objective)
     function g!(G, θ)
         grad = gradient(objective, θ)[1]
@@ -143,11 +157,14 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     objective = form_finding_objective(problem, state; on_iteration=on_iteration)
     gradient! = make_gradient(objective)
     θ0 = pack_parameters(problem, state)
+    lower_bounds, upper_bounds = parameter_bounds(problem)
     result = Optim.optimize(
         objective,
         gradient!,
+        lower_bounds,
+        upper_bounds,
         θ0,
-        LBFGS(),
+        Fminbox(LBFGS()),
         Optim.Options(
             iterations = problem.parameters.solver.max_iterations,
             f_abstol = problem.parameters.solver.absolute_tolerance,

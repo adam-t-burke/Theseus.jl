@@ -7,37 +7,56 @@ x is the input, b is the inflection point bias, k is the sharpness parameter for
 negative k raises a barrier on the left side of the inflection point.
 positive k raises a barrier on the right side of the inflection point.
 """
-function softplus(x::Float64, b::Float64, k::Float64)
-    log1p(exp(-k*(b - x) - 1))
+@inline function softplus(x::Float64, b::Float64, k::Float64)
+    z = -k * (b - x) - 1
+    if z > 0
+        return z + log1p(exp(-z))
+    else
+        return log1p(exp(z))
+    end
 end
 
-function softplus(x::Vector{Float64}, b::Vector{Float64}, k::Float64)
-    log1p.(exp.(-k .* (b .- x) .- 1))
-end
+softplus(x::Vector{Float64}, b::Vector{Float64}, k::Float64) = softplus.(x, b, Ref(k))
 
 
 """
 Penalizes values in vector that are below a threshold 
 """
 function minPenalty(x::Vector{Float64}, values::Vector{Float64}, indices::Vector{Int64}, k::Float64)
-    x = x[indices]
-    sum(softplus(x, values, -k))
+    selected = x[indices]
+    mask = isfinite.(values)
+    if !any(mask)
+        return 0.0
+    end
+    sum(softplus(selected[mask], values[mask], -k))
 end
 
 function minPenalty(x::Vector{Float64}, values::Vector{Float64}, k::Float64)
-    sum(softplus(x, values, -k))
+    mask = isfinite.(values)
+    if !any(mask)
+        return 0.0
+    end
+    sum(softplus(x[mask], values[mask], -k))
 end
 
 """
 Penalizes values in vector that are above a threshold 
 """
 function maxPenalty(x::Vector{Float64}, values::Vector{Float64}, indices::Vector{Int64}, k::Float64)
-    x = x[indices]
-    sum(softplus(x, values, k))
+    selected = x[indices]
+    mask = isfinite.(values)
+    if !any(mask)
+        return 0.0
+    end
+    sum(softplus(selected[mask], values[mask], k))
 end
 
 function maxPenalty(x::Vector{Float64}, values::Vector{Float64}, k::Float64)
-    sum(softplus(x, values, k))
+    mask = isfinite.(values)
+    if !any(mask)
+        return 0.0
+    end
+    sum(softplus(x[mask], values[mask], k))
 end
 
 """
@@ -48,6 +67,7 @@ Prevents discontinuities in the objective function.
 function pBounds(p::Vector{Float64}, lb::Vector{Float64}, ub::Vector{Float64}, kl::Float64, ku::Float64)
     return minPenalty(p, lb, kl) + maxPenalty(p, ub, ku)
 end
+
 """
 Minimze distances between selected target nodes and their corresponding nodes in the form found network.
 """
@@ -105,6 +125,72 @@ Minimize the difference between the form found lengths of the edges and the targ
 
 function lenTarget(lengths::Vector{Float64}, values::Vector{Float64}, indices::Vector{Int64})
     sum((lengths[indices] - values).^2)
+end
+
+
+"""
+    anchor_reactions(topology, q, xyz)
+
+Compute reaction force vectors for every node in the network. Returns an
+`nn × 3` matrix whose rows align with the global node indexing used across
+the problem definition. Rows associated with free nodes are zero.
+"""
+function anchor_reactions(topo::NetworkTopology, q::AbstractVector{<:Real}, xyz::Matrix{Float64})
+    @assert size(xyz, 1) == topo.num_nodes "Geometry matrix must include all nodes"
+    edge_vectors = topo.incidence * xyz
+    axial_vectors = edge_vectors .* q
+    fixed_reactions = -topo.fixed_incidence' * axial_vectors
+
+    n_free = length(topo.free_node_indices)
+    n_fixed = length(topo.fixed_node_indices)
+    dim = size(xyz, 2)
+
+    if n_fixed == 0
+        return zeros(Float64, topo.num_nodes, dim)
+    elseif n_free == 0
+        return fixed_reactions
+    else
+        free_block = zeros(Float64, n_free, dim)
+        return vcat(free_block, fixed_reactions)
+    end
+end
+
+"""
+    reaction_direction_misalignment(reaction, target_dir)
+
+Penalty measuring angular deviation between a reaction vector and a unit
+target direction. Returns zero when the vectors align and increases towards
+two when they oppose each other. A zero reaction incurs a full penalty.
+"""
+function reaction_direction_misalignment(reaction::AbstractVector{<:Real}, target_dir::AbstractVector{<:Real})
+    r_norm = norm(reaction)
+    if r_norm <= eps(Float64)
+        return 1.0
+    end
+    dot_dir = clamp(dot(reaction, target_dir) / r_norm, -1.0, 1.0)
+    1.0 - dot_dir
+end
+
+function reaction_direction_loss(reactions::Matrix{Float64}, objective::ReactionDirectionObjective)
+    total = 0.0
+    for (row_idx, node_idx) in enumerate(objective.anchor_indices)
+        reaction = @view reactions[node_idx, :]
+        target_dir = @view objective.target_directions[row_idx, :]
+        total += reaction_direction_misalignment(reaction, target_dir)
+    end
+    total
+end
+
+function reaction_direction_magnitude_loss(reactions::Matrix{Float64}, objective::ReactionDirectionMagnitudeObjective)
+    total = 0.0
+    for (row_idx, node_idx) in enumerate(objective.anchor_indices)
+        reaction = @view reactions[node_idx, :]
+        target_dir = @view objective.target_directions[row_idx, :]
+        dir_loss = reaction_direction_misalignment(reaction, target_dir)
+        mag_loss = max(norm(reaction) - objective.target_magnitudes[row_idx], 0.0)
+        total += dir_loss + mag_loss
+    end
+    total
 end
 
 
