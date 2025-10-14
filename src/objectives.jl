@@ -7,12 +7,8 @@ x is the input, b is the inflection point bias, k is the sharpness parameter for
 negative k raises a barrier on the left side of the inflection point.
 positive k raises a barrier on the right side of the inflection point.
 """
-function softplus(x::Float64, b::Float64, k::Float64)
-    log1p(exp(-k*(b - x) - 1))
-end
-
-function softplus(x::Vector{Float64}, b::Vector{Float64}, k::Float64)
-    log1p.(exp.(-k .* (b .- x) .- 1))
+@inline function softplus(x::Float64, b::Float64, k::Float64)
+    log1p(exp(-k * (b - x) - 1))
 end
 
 
@@ -20,24 +16,38 @@ end
 Penalizes values in vector that are below a threshold 
 """
 function minPenalty(x::Vector{Float64}, values::Vector{Float64}, indices::Vector{Int64}, k::Float64)
-    x = x[indices]
-    sum(softplus(x, values, -k))
+    total = 0.0
+    @inbounds for (pos, idx) in enumerate(indices)
+        total += softplus(x[idx], values[pos], -k)
+    end
+    total
 end
 
 function minPenalty(x::Vector{Float64}, values::Vector{Float64}, k::Float64)
-    sum(softplus(x, values, -k))
+    total = 0.0
+    @inbounds for i in eachindex(x, values)
+        total += softplus(x[i], values[i], -k)
+    end
+    total
 end
 
 """
 Penalizes values in vector that are above a threshold 
 """
 function maxPenalty(x::Vector{Float64}, values::Vector{Float64}, indices::Vector{Int64}, k::Float64)
-    x = x[indices]
-    sum(softplus(x, values, k))
+    total = 0.0
+    @inbounds for (pos, idx) in enumerate(indices)
+        total += softplus(x[idx], values[pos], k)
+    end
+    total
 end
 
 function maxPenalty(x::Vector{Float64}, values::Vector{Float64}, k::Float64)
-    sum(softplus(x, values, k))
+    total = 0.0
+    @inbounds for i in eachindex(x, values)
+        total += softplus(x[i], values[i], k)
+    end
+    total
 end
 
 """
@@ -51,16 +61,31 @@ end
 """
 Minimze distances between selected target nodes and their corresponding nodes in the form found network.
 """
-function target_xyz(xyz, target, indices)
-    sum((xyz[indices,:] - target).^2)
+function target_xyz(xyz::Matrix{Float64}, target::Matrix{Float64}, indices::Vector{Int})
+    total = 0.0
+    cols = size(target, 2)
+    @inbounds for (pos, idx) in enumerate(indices)
+        for col in 1:cols
+            diff = xyz[idx, col] - target[pos, col]
+            total += diff * diff
+        end
+    end
+    total
 end
 
 """
 Minimize the distance between the x and y coordinates of the target nodes and their corresponding nodes in the form found network.
 Equal to targeting a plan projection of the target nodes. Useful if the target geometry variation is dominated by the x and y coordinates.
 """
-function target_xy(xyz, target, indices)
-    sum((xyz[indices,1:2] - target[:,1:2]).^2)
+function target_xy(xyz::Matrix{Float64}, target::Matrix{Float64}, indices::Vector{Int})
+    total = 0.0
+    @inbounds for (pos, idx) in enumerate(indices)
+        for col in 1:2
+            diff = xyz[idx, col] - target[pos, col]
+            total += diff * diff
+        end
+    end
+    total
 end
 
 """
@@ -86,8 +111,18 @@ end
 Compute difference between the maximum and minimum lengths of the edges in the network.
 """
 function lenVar(x::Vector{Float64}, indices::Vector{Int64})
-    x = x[indices]
-    -reduce(-, extrema(x))
+    min_val = Inf
+    max_val = -Inf
+    @inbounds for idx in indices
+        val = x[idx]
+        if val < min_val
+            min_val = val
+        end
+        if val > max_val
+            max_val = val
+        end
+    end
+    max_val - min_val
 end
 
 """
@@ -95,8 +130,18 @@ Reduce the difference between the maximum and minimum forces in the network.
 From Schek theorem 2. 
 """
 function forceVar(x::Vector{Float64}, indices::Vector{Int64})
-    x = x[indices]
-    -reduce(-, extrema(x))
+    min_val = Inf
+    max_val = -Inf
+    @inbounds for idx in indices
+        val = x[idx]
+        if val < min_val
+            min_val = val
+        end
+        if val > max_val
+            max_val = val
+        end
+    end
+    max_val - min_val
 end
 
 """
@@ -104,7 +149,12 @@ Minimize the difference between the form found lengths of the edges and the targ
 """
 
 function lenTarget(lengths::Vector{Float64}, values::Vector{Float64}, indices::Vector{Int64})
-    sum((lengths[indices] - values).^2)
+    total = 0.0
+    @inbounds for (pos, idx) in enumerate(indices)
+        diff = lengths[idx] - values[pos]
+        total += diff * diff
+    end
+    total
 end
 
 

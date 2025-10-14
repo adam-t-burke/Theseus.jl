@@ -1,5 +1,6 @@
 using JSON3
 using SparseArrays
+using LinearAlgebra
 
 const DEFAULT_BARRIER_SHARPNESS = 10.0
 
@@ -72,12 +73,12 @@ Base.@kwdef struct RigidSetCompareObjective <: AbstractObjective
     target::Matrix{Float64}
 end
 
-struct Bounds
+Base.@kwdef struct Bounds
     lower::Vector{Float64}
     upper::Vector{Float64}
 end
 
-struct SolverOptions
+Base.@kwdef struct SolverOptions
     absolute_tolerance::Float64
     relative_tolerance::Float64
     max_iterations::Int
@@ -85,19 +86,19 @@ struct SolverOptions
     show_progress::Bool
 end
 
-struct TracingOptions
+Base.@kwdef struct TracingOptions
     record_nodes::Bool
     emit_frequency::Int
 end
 
-struct OptimizationParameters
+Base.@kwdef struct OptimizationParameters
     objectives::Vector{AbstractObjective}
     bounds::Bounds
     solver::SolverOptions
     tracing::TracingOptions
 end
 
-struct NetworkTopology
+Base.@kwdef struct NetworkTopology
     incidence::SparseMatrixCSC{Int, Int}
     free_incidence::SparseMatrixCSC{Int, Int}
     fixed_incidence::SparseMatrixCSC{Int, Int}
@@ -107,12 +108,219 @@ struct NetworkTopology
     fixed_node_indices::Vector{Int}
 end
 
-struct LoadData
+Base.@kwdef struct LoadData
     free_node_loads::Matrix{Float64}
 end
 
-struct GeometryData
+Base.@kwdef struct GeometryData
     fixed_node_positions::Matrix{Float64}
+end
+
+Base.@kwdef struct GeometrySnapshot
+    xyz_free::Matrix{Float64}
+    xyz_fixed::Matrix{Float64}
+    xyz_full::Matrix{Float64}
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+end
+
+mutable struct FDMSolverWorkspace
+    # Structural incidence matrices (integer valued, never mutated)
+    Cn_struct::SparseMatrixCSC{Int64,Int64}
+    Cf_struct::SparseMatrixCSC{Int64,Int64}
+
+    # Numeric copies with identical sparsity used for per-iteration scaling
+    Cn_numeric::SparseMatrixCSC{Float64,Int64}
+    Cf_numeric::SparseMatrixCSC{Float64,Int64}
+
+    # Preserved baseline nzval vectors (Float64 conversion of structural signs)
+    base_Cn_nzval::Vector{Float64}
+    base_Cf_nzval::Vector{Float64}
+
+    # Edge -> incidence lookup (CSR-style pointers into structural nzval indices)
+    edge_ptr::Vector{Int}
+    edge_indices::Vector{Int}
+    edge_cols::Vector{Int}
+
+    # Fixed-incidence lookup for rhs sensitivities
+    cf_edge_ptr::Vector{Int}
+    cf_edge_indices::Vector{Int}
+    cf_edge_cols::Vector{Int}
+
+    # Edge pair -> lhs contribution lookup
+    pair_ptr::Vector{Int}
+    pair_k1::Vector{Int}
+    pair_k2::Vector{Int}
+    pair_lhs_idx::Vector{Int}
+
+    # Sparse system matrix pattern and helpers
+    lhs_sparse::SparseMatrixCSC{Float64,Int64}
+    lhs_diag_indices::Vector{Int}
+    factor::Union{SparseArrays.CHOLMOD.Factor{Float64},Nothing}
+    factor_valid::Bool
+
+    # Dense work buffers (reuse across solves)
+    CfNf::Matrix{Float64}
+    qCfNf::Matrix{Float64}
+    CnT_qCfNf::Matrix{Float64}
+    rhs::Matrix{Float64}
+    solution::Matrix{Float64}
+    adjoint_rhs::Matrix{Float64}
+    grad_q::Vector{Float64}
+    grad_fixed::Matrix{Float64}
+
+    ndims::Int
+    reg_eps::Float64
+
+    # Legacy dense copies retained temporarily for compatibility during refactor
+    Cn_dense::Matrix{Float64}
+    Cf_dense::Matrix{Float64}
+    Cnq_dense::Matrix{Float64}
+    Cfq_dense::Matrix{Float64}
+    lhs_dense::Matrix{Float64}
+end
+
+@inline pairkey(row::Int, col::Int) = (Int64(row) << 32) | Int64(col)
+
+function build_edge_lookup(mat::SparseMatrixCSC{<:Any,Int64})
+    ne = size(mat, 1)
+    counts = zeros(Int, ne)
+    for col in 1:size(mat, 2)
+        col_range = mat.colptr[col]:(mat.colptr[col + 1] - 1)
+        @inbounds for idx in col_range
+            edge = mat.rowval[idx]
+            counts[edge] += 1
+        end
+    end
+    ptr = Vector{Int}(undef, ne + 1)
+    ptr[1] = 1
+    for edge in 1:ne
+        ptr[edge + 1] = ptr[edge] + counts[edge]
+    end
+    total = ptr[end] - 1
+    indices = Vector{Int}(undef, total)
+    cols = Vector{Int}(undef, total)
+    fill!(counts, 0)
+    for col in 1:size(mat, 2)
+        col_range = mat.colptr[col]:(mat.colptr[col + 1] - 1)
+        @inbounds for idx in col_range
+            edge = mat.rowval[idx]
+            offset = counts[edge]
+            position = ptr[edge] + offset
+            indices[position] = idx
+            cols[position] = col
+            counts[edge] = offset + 1
+        end
+    end
+    ptr, indices, cols
+end
+
+function build_edge_pairs(edge_ptr::Vector{Int}, edge_indices::Vector{Int}, edge_cols::Vector{Int}, lhs::SparseMatrixCSC{Float64,Int64})
+    ne = length(edge_ptr) - 1
+    total_pairs = 0
+    for edge in 1:ne
+        len = edge_ptr[edge + 1] - edge_ptr[edge]
+        total_pairs += len * len
+    end
+    pair_ptr = Vector{Int}(undef, ne + 1)
+    pair_ptr[1] = 1
+    accum = 1
+    for edge in 1:ne
+        len = edge_ptr[edge + 1] - edge_ptr[edge]
+        accum += len * len
+        pair_ptr[edge + 1] = accum
+    end
+    total = pair_ptr[end] - 1
+    pair_k1 = Vector{Int}(undef, total)
+    pair_k2 = Vector{Int}(undef, total)
+    pair_lhs_idx = Vector{Int}(undef, total)
+
+    lookup = Dict{Int64, Int}()
+    for col in 1:size(lhs, 2)
+        col_range = lhs.colptr[col]:(lhs.colptr[col + 1] - 1)
+        @inbounds for idx in col_range
+            row = lhs.rowval[idx]
+            lookup[pairkey(row, col)] = idx
+        end
+    end
+
+    cursor = 1
+    for edge in 1:ne
+        start = edge_ptr[edge]
+        stop = edge_ptr[edge + 1] - 1
+        @inbounds for offset_i in start:stop
+            k1 = edge_indices[offset_i]
+            col_i = edge_cols[offset_i]
+            for offset_j in start:stop
+                k2 = edge_indices[offset_j]
+                col_j = edge_cols[offset_j]
+                pair_k1[cursor] = k1
+                pair_k2[cursor] = k2
+                pair_lhs_idx[cursor] = lookup[pairkey(col_i, col_j)]
+                cursor += 1
+            end
+        end
+    end
+
+    pair_ptr, pair_k1, pair_k2, pair_lhs_idx
+end
+
+function compute_lhs_diag_indices(lhs::SparseMatrixCSC{Float64,Int64})
+    n = size(lhs, 1)
+    diag = Vector{Int}(undef, n)
+    @inbounds for col in 1:n
+        diag_idx = 0
+        for idx in lhs.colptr[col]:(lhs.colptr[col + 1] - 1)
+            if lhs.rowval[idx] == col
+                diag_idx = idx
+                break
+            end
+        end
+        diag[col] = diag_idx
+    end
+    diag
+end
+
+struct FDMConstantData
+    topology::NetworkTopology
+    ndims::Int
+    reg_eps::Float64
+end
+
+mutable struct FDMCache
+    solver::FDMSolverWorkspace
+    fixed_positions::Matrix{Float64}
+end
+
+struct FDMContext
+    cache::FDMCache
+    constants::FDMConstantData
+end
+
+mutable struct GeometryWorkspace
+    fdm::FDMContext
+    xyz_free::Matrix{Float64}
+    xyz_full::Matrix{Float64}
+    member_vectors::Matrix{Float64}
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+    q_buffer::Vector{Float64}
+    anchor_buffer::Matrix{Float64}
+    theta_lower::Vector{Float64}
+    theta_upper::Vector{Float64}
+    snapshot::GeometrySnapshot
+end
+
+function Base.getproperty(workspace::GeometryWorkspace, name::Symbol)
+    if name === :solver
+        return getfield(getfield(workspace, :fdm), :cache).solver
+    elseif name === :fixed_positions
+        return getfield(getfield(workspace, :fdm), :cache).fixed_positions
+    elseif name === :fdm
+        return getfield(workspace, :fdm)
+    else
+        return getfield(workspace, name)
+    end
 end
 
 Base.@kwdef struct AnchorInfo
@@ -138,9 +346,11 @@ mutable struct OptimizationState
     loss_trace::Vector{Float64}
     node_trace::Vector{Matrix{Float64}}
     iterations::Int
+    workspace::GeometryWorkspace
 end
 
-OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Matrix{Float64}[], 0)
+OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}, workspace::GeometryWorkspace) =
+    OptimizationState(force_densities, variable_anchor_positions, Float64[], Matrix{Float64}[], 0, workspace)
 
 struct ObjectiveContext
     num_edges::Int
@@ -151,14 +361,23 @@ end
 
 default_bounds(ne::Int) = Bounds(fill(-Inf, ne), fill(Inf, ne))
 
-function current_fixed_positions(problem::OptimizationProblem, anchor_positions::Matrix{Float64})
+function current_fixed_positions!(dest::Matrix{Float64}, problem::OptimizationProblem, anchor_positions::Matrix{Float64})
     anchor = problem.anchors
+    copy!(dest, anchor.reference_positions)
     if isempty(anchor.variable_indices)
-        return anchor.reference_positions
+        return dest
     end
-    positions = copy(anchor.reference_positions)
-    positions[anchor.variable_indices, :] .= anchor_positions
-    return positions
+    @inbounds for (local_idx, node_idx) in enumerate(anchor.variable_indices)
+        dest[node_idx, 1] = anchor_positions[local_idx, 1]
+        dest[node_idx, 2] = anchor_positions[local_idx, 2]
+        dest[node_idx, 3] = anchor_positions[local_idx, 3]
+    end
+    dest
+end
+
+function current_fixed_positions(problem::OptimizationProblem, anchor_positions::Matrix{Float64})
+    dest = copy(problem.anchors.reference_positions)
+    current_fixed_positions!(dest, problem, anchor_positions)
 end
 
 current_fixed_positions(problem::OptimizationProblem, state::OptimizationState) =
@@ -293,20 +512,33 @@ function parse_anchor_info(problem::JSON3.Object, fixed_positions::Matrix{Float6
     end
 
     anchors = problem["VariableAnchors"]
-    variable_indices = haskey(problem, "NodeIndex") ? Int.(problem["NodeIndex"]) .+ 1 : Int[]
-    fixed_indices = haskey(problem, "FixedAnchorIndices") ? Int.(problem["FixedAnchorIndices"]) .+ 1 : setdiff(collect(1:size(fixed_positions, 1)), variable_indices)
-
-    init_positions = Matrix{Float64}(undef, length(variable_indices), 3)
-    for (row, anchor) in enumerate(anchors)
-        init_positions[row, 1] = Float64(anchor["InitialX"])
-        init_positions[row, 2] = Float64(anchor["InitialY"])
-        init_positions[row, 3] = Float64(anchor["InitialZ"])
+    if isempty(anchors)
+        return AnchorInfo(fixed_positions)
     end
+
+    variable_indices = if haskey(problem, "NodeIndex")
+        Int.(problem["NodeIndex"]) .+ 1
+    else
+        [Int(anchor["NodeIndex"]) + 1 for anchor in anchors]
+    end
+
+    nvar = length(variable_indices)
+    init_positions = Matrix{Float64}(undef, nvar, 3)
+    for row in 1:nvar
+        idx = variable_indices[row]
+        anchor = anchors[row]
+        ref = fixed_positions[idx, :]
+        init_positions[row, 1] = haskey(anchor, "InitialX") ? Float64(anchor["InitialX"]) : ref[1]
+        init_positions[row, 2] = haskey(anchor, "InitialY") ? Float64(anchor["InitialY"]) : ref[2]
+        init_positions[row, 3] = haskey(anchor, "InitialZ") ? Float64(anchor["InitialZ"]) : ref[3]
+    end
+
+    fixed_indices = haskey(problem, "FixedAnchorIndices") ? Int.(problem["FixedAnchorIndices"]) .+ 1 : setdiff(collect(1:size(fixed_positions, 1)), variable_indices)
 
     AnchorInfo(variable_indices=variable_indices, fixed_indices=fixed_indices, reference_positions=fixed_positions, initial_variable_positions=init_positions)
 end
 
-function normalize_force_densities(values::Vector{Float64}, num_edges::Int)
+function repeat_force_densities(values::Vector{Float64}, num_edges::Int)
     if length(values) == 1
         return fill(values[1], num_edges)
     elseif length(values) == num_edges
@@ -392,11 +624,125 @@ function build_problem(problem::JSON3.Object)
     anchors = parse_anchor_info(problem, geometry.fixed_node_positions)
     parameters = build_parameters(problem, topo)
 
-    q_values = normalize_force_densities(Float64.(problem["Q"]), topo.num_edges)
+    q_values = repeat_force_densities(Float64.(problem["Q"]), topo.num_edges)
     q_init = clamp.(q_values, parameters.bounds.lower, parameters.bounds.upper)
 
     problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
-    state = OptimizationState(q_init, anchors.initial_variable_positions)
+    workspace = create_geometry_workspace(problem_struct)
+    state = OptimizationState(copy(q_init), copy(anchors.initial_variable_positions), workspace)
 
     problem_struct, state
+end
+
+function create_fdmsolver_workspace(topo::NetworkTopology; ndims::Int = 3, reg_eps::Float64 = 1e-12)
+    Cn_struct = convert(SparseMatrixCSC{Int64,Int64}, topo.free_incidence)
+    Cf_struct = convert(SparseMatrixCSC{Int64,Int64}, topo.fixed_incidence)
+
+    Cn_numeric = SparseMatrixCSC{Float64,Int64}(Cn_struct)
+    Cf_numeric = SparseMatrixCSC{Float64,Int64}(Cf_struct)
+
+    base_Cn_nzval = Float64.(Cn_struct.nzval)
+    base_Cf_nzval = Float64.(Cf_struct.nzval)
+    Cn_numeric.nzval .= base_Cn_nzval
+    Cf_numeric.nzval .= base_Cf_nzval
+
+    edge_ptr, edge_indices, edge_cols = build_edge_lookup(Cn_struct)
+    cf_edge_ptr, cf_edge_indices, cf_edge_cols = build_edge_lookup(Cf_struct)
+
+    lhs_pattern = SparseMatrixCSC{Float64,Int64}(transpose(Cn_struct) * Cn_struct)
+    pair_ptr, pair_k1, pair_k2, pair_lhs_idx = build_edge_pairs(edge_ptr, edge_indices, edge_cols, lhs_pattern)
+    lhs_diag_indices = compute_lhs_diag_indices(lhs_pattern)
+
+    ne = topo.num_edges
+    nf = size(Cn_struct, 2)
+    nfixed = size(Cf_struct, 2)
+
+    CfNf = Matrix{Float64}(undef, ne, ndims)
+    qCfNf = Matrix{Float64}(undef, ne, ndims)
+    CnT_qCfNf = Matrix{Float64}(undef, nf, ndims)
+    rhs = Matrix{Float64}(undef, nf, ndims)
+    solution = Matrix{Float64}(undef, nf, ndims)
+    adjoint_rhs = Matrix{Float64}(undef, nf, ndims)
+    grad_q = Vector{Float64}(undef, ne)
+    grad_fixed = Matrix{Float64}(undef, nfixed, ndims)
+
+    Cn_dense = Matrix{Float64}(Cn_struct)
+    Cf_dense = Matrix{Float64}(Cf_struct)
+    Cnq_dense = similar(Cn_dense)
+    Cfq_dense = similar(Cf_dense)
+    lhs_dense = Matrix{Float64}(undef, nf, nf)
+
+    FDMSolverWorkspace(
+        Cn_struct,
+        Cf_struct,
+        Cn_numeric,
+        Cf_numeric,
+        base_Cn_nzval,
+        base_Cf_nzval,
+        edge_ptr,
+        edge_indices,
+        edge_cols,
+    cf_edge_ptr,
+    cf_edge_indices,
+    cf_edge_cols,
+        pair_ptr,
+        pair_k1,
+        pair_k2,
+        pair_lhs_idx,
+        lhs_pattern,
+        lhs_diag_indices,
+        nothing,
+        false,
+        CfNf,
+        qCfNf,
+        CnT_qCfNf,
+        rhs,
+        solution,
+        adjoint_rhs,
+        grad_q,
+    grad_fixed,
+        ndims,
+        reg_eps,
+        Cn_dense,
+        Cf_dense,
+        Cnq_dense,
+        Cfq_dense,
+        lhs_dense,
+    )
+end
+
+function create_geometry_workspace(problem::OptimizationProblem)
+    topo = problem.topology
+    ndims = size(problem.geometry.fixed_node_positions, 2)
+    solver = create_fdmsolver_workspace(topo; ndims=ndims)
+    constants = FDMConstantData(topo, ndims, solver.reg_eps)
+    fixed_positions = copy(problem.geometry.fixed_node_positions)
+    cache = FDMCache(solver, fixed_positions)
+    context = FDMContext(cache, constants)
+
+    xyz_free = cache.solver.solution
+    xyz_full = Matrix{Float64}(undef, topo.num_nodes, 3)
+    member_vectors = Matrix{Float64}(undef, topo.num_edges, 3)
+    member_lengths = Vector{Float64}(undef, topo.num_edges)
+    member_forces = Vector{Float64}(undef, topo.num_edges)
+    q_buffer = Vector{Float64}(undef, topo.num_edges)
+    nvar = size(problem.anchors.initial_variable_positions, 1)
+    anchor_buffer = Matrix{Float64}(undef, nvar, 3)
+    θ_len = topo.num_edges + 3 * nvar
+    theta_lower = Vector{Float64}(undef, θ_len)
+    theta_upper = Vector{Float64}(undef, θ_len)
+    if θ_len > 0
+        copyto!(theta_lower, 1, problem.parameters.bounds.lower, 1, topo.num_edges)
+        copyto!(theta_upper, 1, problem.parameters.bounds.upper, 1, topo.num_edges)
+        if θ_len > topo.num_edges
+            start_idx = topo.num_edges + 1
+            @inbounds for i in start_idx:θ_len
+                theta_lower[i] = -Inf
+                theta_upper[i] = Inf
+            end
+        end
+    end
+
+    snapshot = GeometrySnapshot(xyz_free, cache.fixed_positions, xyz_full, member_lengths, member_forces)
+    GeometryWorkspace(context, xyz_free, xyz_full, member_vectors, member_lengths, member_forces, q_buffer, anchor_buffer, theta_lower, theta_upper, snapshot)
 end

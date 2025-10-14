@@ -27,12 +27,14 @@ function send_message(ws, problem::OptimizationProblem, state::OptimizationState
 end
 
 function direct_solution!(problem::OptimizationProblem, state::OptimizationState, ws)
-    snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
     empty!(state.loss_trace)
+    empty!(state.node_trace)
+    state.iterations = 1
+    snapshot = evaluate_geometry!(state.workspace, problem, state.force_densities, state.variable_anchor_positions)
     push!(state.loss_trace, 0.0)
     send_message(ws, problem, state, snapshot;
         finished = true,
-        iteration = 1,
+        iteration = state.iterations,
         loss = 0.0,
         include_trace = false,
     )
