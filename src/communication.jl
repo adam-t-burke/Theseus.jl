@@ -1,4 +1,5 @@
 import HTTP.WebSockets
+using Logging
 
 cancel = false
 simulating = false
@@ -6,9 +7,7 @@ counter = 0
 
 function start!(;host = "127.0.0.1", port = 2000)
     #start server
-    println("###############################################")
-    println("###############SERVER OPENED###################")
-    println("###############################################")
+    @info "Theseus server listening" host port
 
     ## PERSISTENT LOOP
     WebSockets.listen!(host, port) do ws
@@ -18,7 +17,7 @@ function start!(;host = "127.0.0.1", port = 2000)
             try
                 @async readMSG(msg, ws)
             catch error
-                println(error)
+                @error "WebSocket handler failure" exception=(error, catch_backtrace())
             end
         end
     end
@@ -26,22 +25,22 @@ end
 
 function readMSG(msg, ws)
     # ACKNOWLEDGE
-    println("MSG RECEIVED")
+    @debug "Message received"
 
     # FIRST MESSAGE
     if msg == "init"
-        println("CONNECTION INITIALIZED")
+        @info "Client connection initialized"
         return
     end
 
     if msg == "cancel"
-        println("Operation Cancelled")
+        @info "Cancellation requested"
         global cancel = true
         return
     end
 
     if simulating
-        println("Simulation in progress")
+        @warn "Simulation already in progress"
         return
     end
 
@@ -51,28 +50,25 @@ function readMSG(msg, ws)
         problem, state = build_problem(problem_json)
 
         if isempty(problem.parameters.objectives)
-            println("SOLVING")
+            @info "Running direct solution"
         else
-            println("OPTIMIZING")
+            @info "Running optimization"
         end
 
         if counter == 0
-            println("First run will take a while.")
-            println("Julia needs to compile the code for the first run.")
+            @info "Initial compile will add latency"
         end
         
         # OPTIMIZATION
         global simulating = true
-        @time FDMoptim!(problem, state, ws)
+        elapsed = @elapsed FDMoptim!(problem, state, ws)
+        @info "Simulation finished" elapsed=elapsed
        
     catch error
-        println("INVALID INPUT")
-        println("CHECK PARAMETER BOUNDS")
-        println(error)
+        @error "Invalid input" exception=(error, catch_backtrace())
     end
 
-    println("DONE")
     global simulating = false
     global counter += 1
-    println("Counter $counter")
+    @info "Session complete" counter=counter
 end

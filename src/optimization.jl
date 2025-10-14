@@ -2,6 +2,7 @@ using LinearAlgebra
 using Optim
 using Zygote
 using ChainRulesCore: ignore_derivatives
+using Logging
 
 struct GeometrySnapshot
     xyz_free::Matrix{Float64}
@@ -133,6 +134,27 @@ function form_finding_objective(problem::OptimizationProblem, trace_state::Optim
     objective
 end
 
+function log_lambda_multipliers(min_θ::AbstractVector{<:Real}, grad::AbstractVector{<:Real}, lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real})
+    tol = sqrt(eps(Float64))
+    lower_values = Float64[]
+    upper_values = Float64[]
+    for i in eachindex(min_θ)
+        if isfinite(lower[i]) && min_θ[i] <= lower[i] + tol
+            push!(lower_values, max(0.0, grad[i]))
+        elseif isfinite(upper[i]) && min_θ[i] >= upper[i] - tol
+            push!(upper_values, max(0.0, -grad[i]))
+        end
+    end
+
+    stats(values) = isempty(values) ? (count=0, max=0.0, sum=0.0) : (count=length(values), max=maximum(values), sum=sum(values))
+    lower_stats = stats(lower_values)
+    upper_stats = stats(upper_values)
+
+    @info "KKT multipliers" lower_active=lower_stats.count upper_active=upper_stats.count max_lower=lower_stats.max max_upper=upper_stats.max sum_lower=lower_stats.sum sum_upper=upper_stats.sum
+    @debug "Lower-bound multipliers" values=lower_values
+    @debug "Upper-bound multipliers" values=upper_values
+end
+
 function parameter_bounds(problem::OptimizationProblem)
     bounds = problem.parameters.bounds
     lower = copy(bounds.lower)
@@ -177,5 +199,8 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     state.force_densities = copy(q)
     state.variable_anchor_positions = copy(anchors)
     snapshot = evaluate_geometry(problem, q, anchors)
+
+    grad_at_solution = gradient(objective, min_θ)[1]
+    log_lambda_multipliers(min_θ, grad_at_solution, lower_bounds, upper_bounds)
     return result, snapshot
 end

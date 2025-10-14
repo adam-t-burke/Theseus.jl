@@ -224,7 +224,6 @@ function parse_direction_targets(obj_json, indices::Vector{Int})
     matrix = convert(Matrix{Float64}, vectors')
     size(matrix, 1) == length(indices) || error("Number of direction targets must match indices or be 1")
     size(matrix, 2) == 3 || error("Direction targets must have exactly three components")
-    println("Parsed direction targets: ", matrix)
     matrix
 end
 
