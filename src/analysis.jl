@@ -58,7 +58,9 @@ function FDMoptim!(problem::OptimizationProblem, state::OptimizationState, ws; m
         end
     end
 
-    result, snapshot = optimize_problem!(problem, state; on_iteration = iteration_callback)
+    callback_fn = solver.show_progress ? iteration_callback : nothing
+
+    result, snapshot = optimize_problem!(problem, state; on_iteration = callback_fn)
 
     final_loss = Optim.minimum(result)
     total_iters = Optim.iterations(result)
