@@ -165,13 +165,18 @@ end
 
 default_bounds(ne::Int) = Bounds(fill(1e-8, ne), fill(Inf, ne))
 
-function current_fixed_positions(problem::OptimizationProblem, anchor_positions::Matrix{Float64})
+function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
     anchor = problem.anchors
+    ref = anchor.reference_positions
+    T = promote_type(eltype(ref), eltype(anchor_positions))
     if isempty(anchor.variable_indices)
-        return anchor.reference_positions
+        return T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
     end
-    positions = copy(anchor.reference_positions)
-    positions[anchor.variable_indices, :] .= anchor_positions
+    positions = T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
+    if !isempty(anchor.variable_indices)
+        anchors_converted = eltype(anchor_positions) === T ? anchor_positions : convert(Matrix{T}, anchor_positions)
+        positions[anchor.variable_indices, :] .= anchors_converted
+    end
     return positions
 end
 

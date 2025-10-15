@@ -4,16 +4,16 @@ using Zygote
 using ChainRulesCore: ignore_derivatives
 using Logging
 
-struct GeometrySnapshot
-    xyz_free::Matrix{Float64}
-    xyz_fixed::Matrix{Float64}
-    xyz_full::Matrix{Float64}
-    member_lengths::Vector{Float64}
-    member_forces::Vector{Float64}
-    reactions::Matrix{Float64}
+struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
+    xyz_free::TF
+    xyz_fixed::TX
+    xyz_full::TA
+    member_lengths::VL
+    member_forces::VF
+    reactions::TR
 end
 
-function evaluate_geometry(problem::OptimizationProblem, q::Vector{Float64}, anchor_positions::Matrix{Float64})
+function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real})
     fixed_positions = current_fixed_positions(problem, anchor_positions)
     xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
     xyz_full = vcat(xyz_free, fixed_positions)
@@ -77,10 +77,10 @@ function objective_loss(obj::ReactionDirectionMagnitudeObjective, snapshot::Geom
     obj.weight * reaction_direction_magnitude_loss(snapshot.reactions, obj)
 end
 
-objective_loss(::AbstractObjective, ::GeometrySnapshot) = 0.0
+objective_loss(::AbstractObjective, snapshot::GeometrySnapshot) = zero(eltype(snapshot.member_lengths))
 
-function total_loss(problem::OptimizationProblem, q::Vector{Float64}, anchor_positions::Matrix{Float64}, snapshot::GeometrySnapshot)
-    loss = 0.0
+function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, snapshot::GeometrySnapshot)
+    loss = zero(eltype(snapshot.member_lengths))
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
     end
@@ -94,14 +94,14 @@ function pack_parameters(problem::OptimizationProblem, state::OptimizationState)
     vcat(state.force_densities, vec(state.variable_anchor_positions))
 end
 
-function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{<:Real})
+function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) where {T<:Real}
     ne = problem.topology.num_edges
-    q = Float64.(θ[1:ne])
+    q = copy(@view θ[1:ne])
     nvar = length(problem.anchors.variable_indices)
     if nvar == 0
-        return q, zeros(Float64, 0, 3)
+        return q, zeros(T, 0, 3)
     end
-    anchors = reshape(θ[ne + 1:end], 3, nvar)'
+    anchors = reshape(copy(@view θ[ne + 1:end]), 3, nvar)'
     q, anchors
 end
 
