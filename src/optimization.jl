@@ -105,7 +105,7 @@ function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) 
     q, anchors
 end
 
-function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState; on_iteration=nothing)
+function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState)
     empty!(trace_state.loss_trace)
     empty!(trace_state.node_trace)
     trace_state.iterations = 0
@@ -116,15 +116,11 @@ function form_finding_objective(problem::OptimizationProblem, trace_state::Optim
         loss = total_loss(problem, q, anchors, snapshot)
         if !isderiving()
             ignore_derivatives() do
-                trace_state.iterations += 1
                 trace_state.force_densities = copy(q)
                 trace_state.variable_anchor_positions = copy(anchors)
                 push!(trace_state.loss_trace, loss)
                 if problem.parameters.tracing.record_nodes
                     push!(trace_state.node_trace, copy(snapshot.xyz_full))
-                end
-                if on_iteration !== nothing
-                    on_iteration(trace_state, snapshot, loss)
                 end
             end
         end
@@ -176,10 +172,22 @@ function make_gradient(objective)
 end
 
 function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
-    objective = form_finding_objective(problem, state; on_iteration=on_iteration)
+    objective = form_finding_objective(problem, state)
     gradient! = make_gradient(objective)
     θ0 = pack_parameters(problem, state)
     lower_bounds, upper_bounds = parameter_bounds(problem)
+    outer_iter = Ref(0)
+    callback = function (_opt_state)
+        outer_iter[] += 1
+        state.iterations = outer_iter[]
+        if on_iteration === nothing || isempty(state.loss_trace)
+            return false
+        end
+        snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
+        loss = state.loss_trace[end]
+        on_iteration(state, snapshot, loss)
+        return false
+    end
     result = Optim.optimize(
         objective,
         gradient!,
@@ -191,6 +199,7 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
             iterations = problem.parameters.solver.max_iterations,
             f_abstol = problem.parameters.solver.absolute_tolerance,
             f_reltol = problem.parameters.solver.relative_tolerance,
+            callback = callback,
         ),
     )
 
