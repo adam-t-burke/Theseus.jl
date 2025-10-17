@@ -457,7 +457,7 @@ function build_problem(problem::JSON3.Object)
     parameters = build_parameters(problem, topo)
 
     q_values = build_force_densities(Float64.(problem["Q"]), topo.num_edges)
-    q_init = clamp.(q_values, parameters.bounds.lower, parameters.bounds.upper)
+    q_init = q_values
 
     problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
     state = OptimizationState(q_init, anchors.initial_variable_positions)
