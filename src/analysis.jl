@@ -8,7 +8,7 @@ function loss_trace_or_default(trace::Vector{Float64})
     isempty(trace) ? Float64[] : trace
 end
 
-function send_message(ws, problem::OptimizationProblem, state::OptimizationState, snapshot::GeometrySnapshot; finished::Bool, iteration::Int, loss::Float64, include_trace::Bool)
+function send_message(ws, problem::OptimizationProblem{T}, state::OptimizationState, snapshot::GeometrySnapshot; finished::Bool, iteration::Int, loss::Float64, include_trace::Bool) where {T}
     xyz = assemble_xyz(snapshot)
     payload = Dict(
         "Finished" => finished,
@@ -27,8 +27,8 @@ function send_message(ws, problem::OptimizationProblem, state::OptimizationState
     HTTP.WebSockets.send(ws, JSON3.write(payload))
 end
 
-function direct_solution!(problem::OptimizationProblem, state::OptimizationState, ws)
-    snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
+function direct_solution!(problem::OptimizationProblem{T}, state::OptimizationState, ws) where {T}
+    snapshot = evaluate_geometry!(problem, state.force_densities, state.variable_anchor_positions)
     empty!(state.loss_trace)
     push!(state.loss_trace, 0.0)
     send_message(ws, problem, state, snapshot;
@@ -40,7 +40,7 @@ function direct_solution!(problem::OptimizationProblem, state::OptimizationState
     return snapshot
 end
 
-function FDMoptim!(problem::OptimizationProblem, state::OptimizationState, ws; max_norm::Float64 = 1.0)
+function FDMoptim!(problem::OptimizationProblem{T}, state::OptimizationState, ws; max_norm::Float64 = 1.0) where {T}
     if isempty(problem.parameters.objectives)
         return direct_solution!(problem, state, ws)
     end

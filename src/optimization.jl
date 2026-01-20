@@ -1,27 +1,36 @@
 using LinearAlgebra
 using Optim
-using Zygote
-using ChainRulesCore: ignore_derivatives
+using Mooncake
 using Logging
 
-struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
-    xyz_free::TF
-    xyz_fixed::TX
-    xyz_full::TA
-    member_lengths::VL
-    member_forces::VF
-    reactions::TR
-end
-
-function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real})
-    fixed_positions = current_fixed_positions(problem, anchor_positions)
-    xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
-    xyz_full = vcat(xyz_free, fixed_positions)
-    member_vectors = problem.topology.incidence * xyz_full
-    member_lengths = map(norm, eachrow(member_vectors))
-    member_forces = q .* member_lengths
-    reactions = anchor_reactions(problem.topology, q, xyz_full)
-    GeometrySnapshot(xyz_free, fixed_positions, xyz_full, member_lengths, member_forces, reactions)
+function evaluate_geometry!(problem::OptimizationProblem{T}, q::AbstractVector{Float64}, anchor_positions::AbstractMatrix{Float64}) where {T}
+    ctx = problem.context
+    nf = length(problem.topology.free_node_indices)
+    
+    # In-place updates
+    update_fixed_positions!(ctx, problem.anchors, anchor_positions)
+    solve_explicit!(ctx, q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, ctx.fixed_positions)
+    
+    # xyz_full assembly
+    ctx.xyz_full[1:nf, :] .= ctx.xyz_free
+    # fixed positions in the global indexing are at the end
+    ctx.xyz_full[nf+1:end, :] .= ctx.fixed_positions
+    
+    # incidence * xyz_full
+    mul!(ctx.member_vectors, problem.topology.incidence, ctx.xyz_full)
+    
+    # member_lengths
+    for i in 1:length(ctx.member_lengths)
+        @inbounds ctx.member_lengths[i] = sqrt(ctx.member_vectors[i,1]^2 + ctx.member_vectors[i,2]^2 + ctx.member_vectors[i,3]^2)
+    end
+    
+    # member_forces
+    ctx.member_forces .= q .* ctx.member_lengths
+    
+    # reactions
+    anchor_reactions!(ctx, problem.topology, q)
+    
+    return GeometrySnapshot(ctx.xyz_free, ctx.fixed_positions, ctx.xyz_full, ctx.member_lengths, ctx.member_forces, ctx.reactions)
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -79,62 +88,76 @@ end
 
 objective_loss(::AbstractObjective, snapshot::GeometrySnapshot) = zero(eltype(snapshot.member_lengths))
 
-function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, snapshot::GeometrySnapshot)
-    loss = zero(eltype(snapshot.member_lengths))
+function total_loss(problem::OptimizationProblem{T}, q::AbstractVector{Float64}, anchor_positions::AbstractMatrix{Float64}, snapshot::GeometrySnapshot) where {T}
+    loss = 0.0
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
     end
-    loss
+    return loss
 end
 
-function pack_parameters(problem::OptimizationProblem, state::OptimizationState)
+function pack_parameters(problem::OptimizationProblem{T}, state::OptimizationState) where {T}
     if isempty(problem.anchors.variable_indices)
         return copy(state.force_densities)
     end
-    vcat(state.force_densities, vec(state.variable_anchor_positions))
+    return vcat(state.force_densities, vec(state.variable_anchor_positions))
 end
 
-function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) where {T<:Real}
+function unpack_parameters(problem::OptimizationProblem{T}, θ::AbstractVector{S}) where {T, S<:Real}
     ne = problem.topology.num_edges
     q = copy(@view θ[1:ne])
     nvar = length(problem.anchors.variable_indices)
     if nvar == 0
-        return q, zeros(T, 0, 3)
+        return q, zeros(S, 0, 3)
     end
     anchors = reshape(copy(@view θ[ne + 1:end]), 3, nvar)'
-    q, anchors
+    return q, collect(anchors)
 end
 
-function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState, lb, ub, lb_idx, ub_idx, geo_scale, barrier_weight, sharpness)
+function log_trace_info!(trace_state::OptimizationState, q::AbstractVector{Float64}, anchors::AbstractMatrix{Float64}, geometric_loss::Float64, barrier_loss::Float64, snapshot::GeometrySnapshot)
+    trace_state.force_densities .= q
+    if !isempty(anchors)
+        trace_state.variable_anchor_positions .= anchors
+    end
+    push!(trace_state.loss_trace, geometric_loss)
+    push!(trace_state.penalty_trace, barrier_loss)
+    # push!(trace_state.node_trace, copy(snapshot.xyz_full))
+    return nothing
+end
+
+struct ObjectiveWrapper{TFact}
+    problem::OptimizationProblem{TFact}
+    trace_state::OptimizationState
+    lb::Vector{Float64}
+    ub::Vector{Float64}
+    lb_idx::Vector{Int64}
+    ub_idx::Vector{Int64}
+    geo_scale::Float64
+    barrier_weight::Float64
+    sharpness::Float64
+end
+
+function (obj::ObjectiveWrapper{TFact})(θ) where {TFact}
+    q, anchors = unpack_parameters(obj.problem, θ)
+    snapshot = evaluate_geometry!(obj.problem, q, anchors)
+    
+    geometric_loss = total_loss(obj.problem, q, anchors, snapshot)
+    barrier_loss = pBounds(θ, obj.lb, obj.ub, obj.lb_idx, obj.ub_idx, obj.sharpness, obj.sharpness)
+    
+    loss = (geometric_loss * obj.geo_scale) + (barrier_loss * obj.barrier_weight)
+    
+    log_trace_info!(obj.trace_state, q, anchors, geometric_loss, barrier_loss, snapshot)
+    
+    loss
+end
+
+function form_finding_objective(problem::OptimizationProblem{TFact}, trace_state::OptimizationState, lb, ub, lb_idx, ub_idx, geo_scale, barrier_weight, sharpness) where {TFact}
     empty!(trace_state.loss_trace)
     empty!(trace_state.penalty_trace)
     empty!(trace_state.node_trace)
     trace_state.iterations = 0
 
-    function objective(θ)
-        q, anchors = unpack_parameters(problem, θ)
-        snapshot = evaluate_geometry(problem, q, anchors)
-        
-        geometric_loss = total_loss(problem, q, anchors, snapshot)
-        barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)
-        
-        loss = (geometric_loss * geo_scale) + (barrier_loss * barrier_weight)
-        
-        if !isderiving()
-            ignore_derivatives() do
-                trace_state.force_densities = copy(q)
-                trace_state.variable_anchor_positions = copy(anchors)
-                push!(trace_state.loss_trace, loss)
-                push!(trace_state.penalty_trace, barrier_loss * barrier_weight)
-                if problem.parameters.tracing.record_nodes
-                    push!(trace_state.node_trace, copy(snapshot.xyz_full))
-                end
-            end
-        end
-        loss
-    end
-
-    objective
+    return ObjectiveWrapper{TFact}(problem, trace_state, lb, ub, lb_idx, ub_idx, geo_scale, barrier_weight, sharpness)
 end
 
 function parameter_bounds(problem::OptimizationProblem)
@@ -149,15 +172,28 @@ function parameter_bounds(problem::OptimizationProblem)
     lower, upper
 end
 
-function make_gradient(objective)
+function make_gradient(objective, θ0)
+    # Using friendly_tangents=false avoids complex struct recreation Mooncake's "friendly" conversion,
+    # which is likely failing on your objective struct/closure due to captured factorizations 
+    # or Julia 1.12 memory layout changes.
+    cache = Mooncake.prepare_gradient_cache(objective, θ0; friendly_tangents=false)
     function g!(G, θ)
-        grad = gradient(objective, θ)[1]
-        copyto!(G, grad)
+        _, grads = Mooncake.value_and_gradient!!(
+            cache, objective, θ; 
+            args_to_zero=(false, true)
+        )
+        # With friendly_tangents=false, the gradient is often a Tangent or MutableTangent.
+        # For a Vector input, it should be obtainable via .fields or directly if it's Bits.
+        if grads[2] isa AbstractVector
+            copyto!(G, grads[2])
+        else
+            copyto!(G, grads[2].fields)
+        end
     end
     g!
 end
 
-function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
+function optimize_problem!(problem::OptimizationProblem{T}, state::OptimizationState; on_iteration=nothing) where {T}
     solver = problem.parameters.solver
     lower_bounds, upper_bounds = parameter_bounds(problem)
     θ0 = pack_parameters(problem, state)
@@ -177,13 +213,13 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     geo_scale = 1.0
     if solver.use_auto_scaling
         q0, a0 = unpack_parameters(problem, θ0)
-        snap0 = evaluate_geometry(problem, q0, a0)
+        snap0 = evaluate_geometry!(problem, q0, a0)
         L0 = total_loss(problem, q0, a0, snap0)
         geo_scale = 1.0 / max(L0, 1e-6)
     end
 
     objective = form_finding_objective(problem, state, lower_bounds, upper_bounds, lb_idx, ub_idx, geo_scale, solver.barrier_weight, solver.barrier_sharpness)
-    gradient! = make_gradient(objective)
+    gradient! = make_gradient(objective, θ0)
     
     outer_iter = Ref(0)
     callback = function (_opt_state)
@@ -192,7 +228,7 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
         if on_iteration === nothing || isempty(state.loss_trace)
             return false
         end
-        snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
+        snapshot = evaluate_geometry!(problem, state.force_densities, state.variable_anchor_positions)
         loss = state.loss_trace[end]
         on_iteration(state, snapshot, loss)
         return false
@@ -215,7 +251,7 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     q, anchors = unpack_parameters(problem, min_θ)
     state.force_densities = copy(q)
     state.variable_anchor_positions = copy(anchors)
-    snapshot = evaluate_geometry(problem, q, anchors)
+    snapshot = evaluate_geometry!(problem, q, anchors)
 
     return result, snapshot
 end
