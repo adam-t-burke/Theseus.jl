@@ -105,20 +105,27 @@ function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) 
     q, anchors
 end
 
-function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState)
+function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState, lb, ub, lb_idx, ub_idx, geo_scale, barrier_weight, sharpness)
     empty!(trace_state.loss_trace)
+    empty!(trace_state.penalty_trace)
     empty!(trace_state.node_trace)
     trace_state.iterations = 0
 
     function objective(θ)
         q, anchors = unpack_parameters(problem, θ)
         snapshot = evaluate_geometry(problem, q, anchors)
-        loss = total_loss(problem, q, anchors, snapshot)
+        
+        geometric_loss = total_loss(problem, q, anchors, snapshot)
+        barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)
+        
+        loss = (geometric_loss * geo_scale) + (barrier_loss * barrier_weight)
+        
         if !isderiving()
             ignore_derivatives() do
                 trace_state.force_densities = copy(q)
                 trace_state.variable_anchor_positions = copy(anchors)
                 push!(trace_state.loss_trace, loss)
+                push!(trace_state.penalty_trace, barrier_loss * barrier_weight)
                 if problem.parameters.tracing.record_nodes
                     push!(trace_state.node_trace, copy(snapshot.xyz_full))
                 end
@@ -128,27 +135,6 @@ function form_finding_objective(problem::OptimizationProblem, trace_state::Optim
     end
 
     objective
-end
-
-function log_lambda_multipliers(min_θ::AbstractVector{<:Real}, grad::AbstractVector{<:Real}, lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real})
-    tol = sqrt(eps(Float64))
-    lower_values = Float64[]
-    upper_values = Float64[]
-    for i in eachindex(min_θ)
-        if isfinite(lower[i]) && min_θ[i] <= lower[i] + tol
-            push!(lower_values, max(0.0, grad[i]))
-        elseif isfinite(upper[i]) && min_θ[i] >= upper[i] - tol
-            push!(upper_values, max(0.0, -grad[i]))
-        end
-    end
-
-    stats(values) = isempty(values) ? (count=0, max=0.0, sum=0.0) : (count=length(values), max=maximum(values), sum=sum(values))
-    lower_stats = stats(lower_values)
-    upper_stats = stats(upper_values)
-
-    @info "KKT multipliers" lower_active=lower_stats.count upper_active=upper_stats.count max_lower=lower_stats.max max_upper=upper_stats.max sum_lower=lower_stats.sum sum_upper=upper_stats.sum
-    @debug "Lower-bound multipliers" values=lower_values
-    @debug "Upper-bound multipliers" values=upper_values
 end
 
 function parameter_bounds(problem::OptimizationProblem)
@@ -172,10 +158,33 @@ function make_gradient(objective)
 end
 
 function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
-    objective = form_finding_objective(problem, state)
-    gradient! = make_gradient(objective)
-    θ0 = pack_parameters(problem, state)
+    solver = problem.parameters.solver
     lower_bounds, upper_bounds = parameter_bounds(problem)
+    θ0 = pack_parameters(problem, state)
+    
+    # Precompute barrier indices
+    lb_idx = findall(isfinite, lower_bounds)
+    ub_idx = findall(isfinite, upper_bounds)
+    
+    # check initial bounds
+    initial_violations_lower = θ0[lb_idx] .< lower_bounds[lb_idx]
+    initial_violations_upper = θ0[ub_idx] .> upper_bounds[ub_idx]
+    if any(initial_violations_lower) || any(initial_violations_upper)
+        @warn "Initial guess is outside bounds" num_lower=sum(initial_violations_lower) num_upper=sum(initial_violations_upper)
+    end
+
+    # Auto-scaling
+    geo_scale = 1.0
+    if solver.use_auto_scaling
+        q0, a0 = unpack_parameters(problem, θ0)
+        snap0 = evaluate_geometry(problem, q0, a0)
+        L0 = total_loss(problem, q0, a0, snap0)
+        geo_scale = 1.0 / max(L0, 1e-6)
+    end
+
+    objective = form_finding_objective(problem, state, lower_bounds, upper_bounds, lb_idx, ub_idx, geo_scale, solver.barrier_weight, solver.barrier_sharpness)
+    gradient! = make_gradient(objective)
+    
     outer_iter = Ref(0)
     callback = function (_opt_state)
         outer_iter[] += 1
@@ -188,17 +197,16 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
         on_iteration(state, snapshot, loss)
         return false
     end
+    
     result = Optim.optimize(
         objective,
         gradient!,
-        lower_bounds,
-        upper_bounds,
         θ0,
-        Fminbox(LBFGS()),
+        LBFGS(),
         Optim.Options(
-            iterations = problem.parameters.solver.max_iterations,
-            f_abstol = problem.parameters.solver.absolute_tolerance,
-            f_reltol = problem.parameters.solver.relative_tolerance,
+            iterations = solver.max_iterations,
+            f_abstol = solver.absolute_tolerance,
+            f_reltol = solver.relative_tolerance,
             callback = callback,
         ),
     )
@@ -209,7 +217,5 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     state.variable_anchor_positions = copy(anchors)
     snapshot = evaluate_geometry(problem, q, anchors)
 
-    grad_at_solution = gradient(objective, min_θ)[1]
-    log_lambda_multipliers(min_θ, grad_at_solution, lower_bounds, upper_bounds)
     return result, snapshot
 end

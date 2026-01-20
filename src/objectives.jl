@@ -76,6 +76,17 @@ function pBounds(p::AbstractVector{<:Real}, lb::AbstractVector{<:Real}, ub::Abst
     minPenalty(p, lb, kl) + maxPenalty(p, ub, ku)
 end
 
+function pBounds(p::AbstractVector{<:Real}, lb::AbstractVector{<:Real}, ub::AbstractVector{<:Real}, lb_indices::AbstractVector{<:Integer}, ub_indices::AbstractVector{<:Integer}, kl::Real, ku::Real)
+    loss = zero(eltype(p))
+    if !isempty(lb_indices)
+        loss += sum(softplus(p[lb_indices], lb[lb_indices], -kl))
+    end
+    if !isempty(ub_indices)
+        loss += sum(softplus(p[ub_indices], ub[ub_indices], ku))
+    end
+    loss
+end
+
 """
 Minimze distances between selected target nodes and their corresponding nodes in the form found network.
 """

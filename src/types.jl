@@ -97,6 +97,9 @@ struct SolverOptions
     max_iterations::Int
     report_frequency::Int
     show_progress::Bool
+    barrier_weight::Float64
+    barrier_sharpness::Float64
+    use_auto_scaling::Bool
 end
 
 struct TracingOptions
@@ -150,11 +153,12 @@ mutable struct OptimizationState
     force_densities::Vector{Float64}
     variable_anchor_positions::Matrix{Float64}
     loss_trace::Vector{Float64}
+    penalty_trace::Vector{Float64}
     node_trace::Vector{Matrix{Float64}}
     iterations::Int
 end
 
-OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Matrix{Float64}[], 0)
+OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Float64[], Matrix{Float64}[], 0)
 
 struct ObjectiveContext
     num_edges::Int
@@ -342,7 +346,12 @@ function parse_solver_options(parameters_json::JSON3.Object)
     max_iter = haskey(parameters_json, "MaxIterations") ? Int(parameters_json["MaxIterations"]) : 500
     freq = haskey(parameters_json, "UpdateFrequency") ? Int(parameters_json["UpdateFrequency"]) : 1
     show = haskey(parameters_json, "ShowIterations") ? Bool(parameters_json["ShowIterations"]) : false
-    SolverOptions(abs_tol, rel_tol, max_iter, freq, show)
+    
+    barrier_weight = haskey(parameters_json, "BarrierWeight") ? Float64(parameters_json["BarrierWeight"]) : 1000.0
+    barrier_sharpness = haskey(parameters_json, "BarrierSharpness") ? Float64(parameters_json["BarrierSharpness"]) : DEFAULT_BARRIER_SHARPNESS
+    auto_scale = haskey(parameters_json, "AutoScale") ? Bool(parameters_json["AutoScale"]) : true
+    
+    SolverOptions(abs_tol, rel_tol, max_iter, freq, show, barrier_weight, barrier_sharpness, auto_scale)
 end
 
 function parse_tracing_options(parameters_json::JSON3.Object)
@@ -435,7 +444,7 @@ end
 
 function build_parameters(problem::JSON3.Object, topo::NetworkTopology)
     if !haskey(problem, "Parameters")
-        return OptimizationParameters(AbstractObjective[], default_bounds(topo.num_edges), SolverOptions(1e-6, 1e-6, 1, 1, false), TracingOptions(false, 1))
+        return OptimizationParameters(AbstractObjective[], default_bounds(topo.num_edges), SolverOptions(1e-6, 1e-6, 1, 1, false, 1000.0, DEFAULT_BARRIER_SHARPNESS, true), TracingOptions(false, 1))
     end
 
     params_json = problem["Parameters"]

@@ -19,6 +19,7 @@ function send_message(ws, problem::OptimizationProblem, state::OptimizationState
         "Y" => xyz[:, 2],
         "Z" => xyz[:, 3],
         "Losstrace" => copy(loss_trace_or_default(state.loss_trace)),
+        "Penaltytrace" => copy(loss_trace_or_default(state.penalty_trace)),
     )
     if include_trace
         payload["NodeTrace"] = copy(state.node_trace)
