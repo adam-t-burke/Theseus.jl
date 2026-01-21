@@ -13,19 +13,18 @@ Exploits symmetry and reuses CPU factorization for the adjoint solve.
 """
 function Mooncake.rrule!!(
     ::CoDual{typeof(solve_fdm!)},
-    cache_dual::CoDual{<:FDMCache},
+    problem_dual::CoDual{<:OptimizationProblem},
     q_dual::CoDual{<:AbstractVector},
-    problem_dual::CoDual{<:OptimizationProblem}
+    anchors_dual::CoDual{<:AbstractMatrix},
+    cache_dual::CoDual{<:FDMCache}
 )
-    cache = cache_dual.x
-    q = q_dual.x
     problem = problem_dual.x
+    q = q_dual.x
+    anchors = anchors_dual.x
+    cache = cache_dual.x
     
     # 1. Forward Pass
-    x_free = solve_fdm!(cache, q, problem)
-    
-    # Primal result. x_free is just the Matrix from the integrator.
-    # Note: solve_fdm! returns cache.integrator.u.
+    x_free = solve_fdm!(problem, q, anchors, cache)
     
     function solve_fdm_pullback!!(dx_free_rdata)
         # dx_free_rdata is (N_f, 3) nodal sensitiveities.
@@ -45,14 +44,11 @@ function Mooncake.rrule!!(
         CUDA.fill!(cache.λ_gpu, 0.0)
         
         n_free = length(cache.free_node_indices_gpu)
-        threads = 256
+        threads = 256 # multiple of 32 (warp size), good balance of occupancy and resource usage
         blocks = ceil(Int, n_free / threads)
         @cuda threads=threads blocks=blocks kernel_scatter_lambda!(cache.λ_gpu, cache.λ_free_gpu, cache.free_node_indices_gpu)
         
-        # b. Sync nodal positions to GPU x_gpu
-        fixed_pos = current_fixed_positions(problem, zeros(0,3))
-        x_full = vcat(x_free, fixed_pos)
-        copyto!(cache.x_gpu, x_full)
+        # x_gpu is already synced by solve_fdm!
         
         # 3. Compute Edge Gradient dq on GPU
         n_edges = size(cache.edge_nodes, 1)
@@ -61,9 +57,10 @@ function Mooncake.rrule!!(
         
         # 4. Download dq to CPU
         dq_rdata = vec(Array(cache.dq_gpu))
+        da_rdata = zero(anchors)
         
-        # Return RData for (typeof(solve_fdm!), cache, q, problem)
-        return NoRData(), NoRData(), dq_rdata, NoRData()
+        # Return RData for (typeof(solve_fdm!), problem, q, anchors, cache)
+        return NoRData(), NoRData(), dq_rdata, da_rdata, NoRData()
     end
     
     return CoDual(x_free, NoFData()), solve_fdm_pullback!!

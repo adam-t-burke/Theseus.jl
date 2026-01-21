@@ -6,29 +6,32 @@ using Logging
 using CUDA
 
 """
-    evaluate_geometry!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
+    evaluate_geometry!(cache::FDMCache, q::AbstractVector{Float64}, variable_anchors::AbstractMatrix{Float64}, problem::OptimizationProblem)
 
-In-place geometry evaluation using GPU kernels.
+High-performance, zero-allocation geometry evaluation using GPU kernels.
 """
-function evaluate_geometry!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
-    # 1. Solve FDM on CPU
-    x_free = solve_fdm!(cache, q, problem)
-    
-    # 2. Update GPU buffers
-    # Sync nodal positions to x_gpu
-    fixed_pos = current_fixed_positions(problem, zeros(0,3))
-    copyto!(cache.x_gpu, [x_free; fixed_pos]) # Ideally this should be more direct
-    
-    # Sync q to q_gpu
+function evaluate_geometry!(cache::FDMCache, q::AbstractVector{Float64}, variable_anchors::AbstractMatrix{Float64}, problem::OptimizationProblem)
+    # 1. Update force densities on GPU
     copyto!(cache.q_gpu, q)
+
+    # 2. Solve FDM (Updates x_gpu internally)
+    solve_fdm!(problem, q, variable_anchors, cache)
     
     # 3. Compute L and F on GPU
     n_edges = size(cache.edge_nodes, 1)
-    threads = 256
+    threads = 256 # multiple of 32 (warp size), good balance of occupancy and resource usage
     blocks = ceil(Int, n_edges / threads)
-    @cuda threads=threads blocks=blocks kernel_compute_geometry!(cache.x_gpu, cache.edge_nodes, cache.q_gpu, cache.L_gpu, cache.F_gpu)
+    @cuda threads=threads blocks=blocks kernel_compute_geometry!(
+        cache.x_gpu, cache.edge_nodes, cache.q_gpu, cache.L_gpu, cache.F_gpu
+    )
     
-    return x_free
+    # 4. Compute Reactions on GPU
+    CUDA.fill!(cache.reactions_gpu, 0.0)
+    @cuda threads=threads blocks=blocks kernel_compute_reactions!(
+        cache.reactions_gpu, cache.x_gpu, cache.edge_nodes, cache.q_gpu, cache.fixed_node_to_fixed_idx_gpu
+    )
+
+    return nothing
 end
 
 function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real})
@@ -105,6 +108,158 @@ function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anc
     loss
 end
 
+function total_loss_gpu(problem::OptimizationProblem, cache::FDMCache)
+    loss = 0.0
+    for obj in problem.parameters.objectives
+        loss += objective_loss_gpu(obj, cache)
+    end
+    loss
+end
+
+# Default fallback
+objective_loss_gpu(obj::AbstractObjective, cache::FDMCache) = 0.0
+
+function get_obj_gpu_data(obj::AbstractObjective, cache::FDMCache, field_name::Symbol)
+    # Check if we already have it
+    key = (obj, field_name)
+    if !haskey(cache.objective_targets, key)
+        # Upload data to GPU
+        data = getfield(obj, field_name)
+        cache.objective_targets[key] = CuArray(data)
+    end
+    return cache.objective_targets[key]
+end
+
+function objective_loss_gpu(obj::SumForceLengthObjective, cache::FDMCache)
+    @view(cache.L_gpu[obj.edge_indices])' * @view(cache.F_gpu[obj.edge_indices]) * obj.weight
+end
+
+function objective_loss_gpu(obj::TargetXYZObjective, cache::FDMCache)
+    target = get_obj_gpu_data(obj, cache, :target)
+    diff = @view(cache.x_gpu[obj.node_indices, :]) .- target
+    obj.weight * CUDA.sum(diff .^ 2)
+end
+
+function objective_loss_gpu(obj::TargetXYObjective, cache::FDMCache)
+    target = get_obj_gpu_data(obj, cache, :target)
+    # Only compare first 2 columns (x and y)
+    diff = @view(cache.x_gpu[obj.node_indices, 1:2]) .- @view(target[:, 1:2])
+    obj.weight * CUDA.sum(diff .^ 2)
+end
+
+function objective_loss_gpu(obj::TargetLengthObjective, cache::FDMCache)
+    target = get_obj_gpu_data(obj, cache, :target)
+    diff = @view(cache.L_gpu[obj.edge_indices]) .- target
+    obj.weight * CUDA.sum(diff .^ 2)
+end
+
+function objective_loss_gpu(obj::MinLengthObjective, cache::FDMCache)
+    threshold = get_obj_gpu_data(obj, cache, :threshold)
+    vals = @view(cache.L_gpu[obj.edge_indices])
+    # z = k * (threshold - vals) - 1
+    obj.weight * CUDA.sum(log1p.(exp.(obj.sharpness .* (threshold .- vals) .- 1.0)))
+end
+
+function objective_loss_gpu(obj::MaxLengthObjective, cache::FDMCache)
+    threshold = get_obj_gpu_data(obj, cache, :threshold)
+    vals = @view(cache.L_gpu[obj.edge_indices])
+    # z = sharpness * (vals - threshold) - 1
+    obj.weight * CUDA.sum(log1p.(exp.(obj.sharpness .* (vals .- threshold) .- 1.0)))
+end
+
+function objective_loss_gpu(obj::MinForceObjective, cache::FDMCache)
+    threshold = get_obj_gpu_data(obj, cache, :threshold)
+    vals = @view(cache.F_gpu[obj.edge_indices])
+    obj.weight * CUDA.sum(log1p.(exp.(obj.sharpness .* (threshold .- vals) .- 1.0)))
+end
+
+function objective_loss_gpu(obj::MaxForceObjective, cache::FDMCache)
+    threshold = get_obj_gpu_data(obj, cache, :threshold)
+    vals = @view(cache.F_gpu[obj.edge_indices])
+    obj.weight * CUDA.sum(log1p.(exp.(obj.sharpness .* (vals .- threshold) .- 1.0)))
+end
+
+function objective_loss_gpu(obj::LengthVariationObjective, cache::FDMCache)
+    vals = @view(cache.L_gpu[obj.edge_indices])
+    obj.weight * (maximum(vals) - minimum(vals))
+end
+
+function objective_loss_gpu(obj::ForceVariationObjective, cache::FDMCache)
+    vals = @view(cache.F_gpu[obj.edge_indices])
+    obj.weight * (maximum(vals) - minimum(vals))
+end
+
+function objective_loss_gpu(obj::RigidSetCompareObjective, cache::FDMCache)
+    xyz = @view(cache.x_gpu[obj.node_indices, :])
+    target = get_obj_gpu_data(obj, cache, :target)
+    
+    # Calculate pair distances on GPU
+    # This matches the CPU rigidSetCompare logic
+    n = size(xyz, 1)
+    
+    # For small n, we can do this with broadcasting
+    # xyz is (n, 3). We want (n, n) matrix of distances.
+    # dist[i, j] = norm(xyz[i, :] - xyz[j, :])
+    
+    # Broadcast subtraction: (n, 1, 3) - (1, n, 3) -> (n, n, 3)
+    diffs = reshape(xyz, n, 1, 3) .- reshape(xyz, 1, n, 3)
+    test_dists = sqrt.(sum(diffs.^2, dims=3))
+    
+    # Same for target
+    target_diffs = reshape(target, n, 1, 3) .- reshape(target, 1, n, 3)
+    target_dists = sqrt.(sum(target_diffs.^2, dims=3))
+    
+    obj.weight * CUDA.sum((target_dists .- test_dists).^2)
+end
+
+function objective_loss_gpu(obj::ReactionDirectionObjective, cache::FDMCache)
+    # Pre-map anchor indices to fixed indices if not done
+    key = (obj, :mapped_fixed_indices)
+    if !haskey(cache.objective_targets, key)
+        node_to_fixed = Vector(cache.fixed_node_to_fixed_idx_gpu)
+        fixed_indices = [Int(node_to_fixed[i]) for i in obj.anchor_indices]
+        cache.objective_targets[key] = CuArray(fixed_indices)
+    end
+    fixed_indices = cache.objective_targets[key]
+    
+    reactions = @view(cache.reactions_gpu[fixed_indices, :])
+    targets = get_obj_gpu_data(obj, cache, :target_directions)
+    
+    # R_norm = sqrt(Rx^2 + Ry^2 + Rz^2)
+    # misalignment = 1 - (R ⋅ target) / R_norm
+    r_norms = sqrt.(sum(reactions.^2, dims=2))
+    # Avoid div by zero
+    dots = sum(reactions .* targets, dims=2)
+    misalignments = 1.0 .- (dots ./ max.(r_norms, 1e-12))
+    
+    # misalignment is 1.0 if r_norm is 0
+    # handled by max.(r_norms, 1e-12) -> misalignment approx 1 - 0 = 1
+    
+    obj.weight * CUDA.sum(misalignments)
+end
+
+function objective_loss_gpu(obj::ReactionDirectionMagnitudeObjective, cache::FDMCache)
+    key = (obj, :mapped_fixed_indices)
+    if !haskey(cache.objective_targets, key)
+        node_to_fixed = Vector(cache.fixed_node_to_fixed_idx_gpu)
+        fixed_indices = [Int(node_to_fixed[i]) for i in obj.anchor_indices]
+        cache.objective_targets[key] = CuArray(fixed_indices)
+    end
+    fixed_indices = cache.objective_targets[key]
+    
+    reactions = @view(cache.reactions_gpu[fixed_indices, :])
+    targets = get_obj_gpu_data(obj, cache, :target_directions)
+    target_mags = get_obj_gpu_data(obj, cache, :target_magnitudes)
+    
+    r_norms = sqrt.(sum(reactions.^2, dims=2))
+    dots = sum(reactions .* targets, dims=2)
+    dir_loss = 1.0 .- (dots ./ max.(r_norms, 1e-12))
+    
+    mag_loss = max.(r_norms .- target_mags, 0.0)
+    
+    obj.weight * CUDA.sum(dir_loss .+ mag_loss)
+end
+
 function pack_parameters(problem::OptimizationProblem, state::OptimizationState)
     if isempty(problem.anchors.variable_indices)
         return copy(state.force_densities)
@@ -128,24 +283,32 @@ function form_finding_objective(problem::OptimizationProblem, trace_state::Optim
     empty!(trace_state.penalty_trace)
     empty!(trace_state.node_trace)
     trace_state.iterations = 0
+    cache = trace_state.cache
 
     function objective(θ)
         q, anchors = unpack_parameters(problem, θ)
-        snapshot = evaluate_geometry(problem, q, anchors)
         
-        geometric_loss = total_loss(problem, q, anchors, snapshot)
+        geometric_loss = 0.0
+        if cache !== nothing
+            evaluate_geometry!(cache, q, anchors, problem)
+            geometric_loss = total_loss_gpu(problem, cache)
+        else
+            snapshot = evaluate_geometry(problem, q, anchors)
+            geometric_loss = total_loss(problem, q, anchors, snapshot)
+        end
+        
         barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)
-        
         loss = (geometric_loss * geo_scale) + (barrier_loss * barrier_weight)
         
         if !isderiving()
             ignore_derivatives() do
-                trace_state.force_densities = copy(q)
-                trace_state.variable_anchor_positions = copy(anchors)
+                trace_state.force_densities .= q
+                trace_state.variable_anchor_positions .= anchors
                 push!(trace_state.loss_trace, loss)
                 push!(trace_state.penalty_trace, barrier_loss * barrier_weight)
                 if problem.parameters.tracing.record_nodes
-                    push!(trace_state.node_trace, copy(snapshot.xyz_full))
+                    xyz = (cache !== nothing) ? Vector(cache.x_gpu) : evaluate_geometry(problem, q, anchors).xyz_full
+                    push!(trace_state.node_trace, reshape(xyz, :, size(xyz, 1) ÷ 3))
                 end
             end
         end
@@ -259,7 +422,77 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
 end
 
 function run_admm!(problem::OptimizationProblem, state::OptimizationState, cache::FDMCache, θ0; on_iteration=nothing)
-    @info "ADMM implementation in progress..."
-    # TODO: Implement ADMM consensus loop
+    q, anchors = unpack_parameters(problem, θ0)
+    copyto!(cache.q_gpu, q)
+    
+    # Initialize targets on GPU
+    extract_admm_targets!(problem, cache)
+    
+    m = problem.topology.num_edges
+    threads = 256 # multiple of 32 (warp size), good balance of occupancy and resource usage
+    blocks = ceil(Int, m / threads)
+    
+    solver = problem.parameters.solver
+    
+    for i in 1:solver.admm_iterations
+        # 1. x-update: Physics (Sparse Solve on CPU)
+        # Pull current force densities to CPU
+        copyto!(cache.q_cpu, cache.q_gpu)
+        
+        # solve_fdm! updates cache.x_gpu internally
+        solve_fdm!(problem, cache.q_cpu, anchors, cache)
+        
+        # 2. z-update: Geometric Projections (GPU)
+        @cuda threads=threads blocks=blocks kernel_admm_z_update!(
+            cache.x_gpu, cache.edge_nodes, cache.y_dual, cache.z_consensus,
+            cache.l_min_consolidated, cache.l_max_consolidated, cache.f_target_consolidated, cache.q_gpu
+        )
+        
+        # 3. Dual and Force Density Update (GPU)
+        @cuda threads=threads blocks=blocks kernel_admm_dual_q_update!(
+            cache.x_gpu, cache.edge_nodes, cache.z_consensus, cache.y_dual, 
+            cache.q_gpu, solver.rho
+        )
+        
+        # Progress Reporting
+        if solver.show_progress && (i % solver.report_frequency == 0)
+            @info "ADMM Iteration $i/$(solver.admm_iterations)"
+        end
+
+        if on_iteration !== nothing && (i % solver.report_frequency == 0)
+            state.force_densities .= Vector(cache.q_gpu)
+            snapshot = evaluate_geometry(problem, state.force_densities, anchors)
+            on_iteration(state, snapshot, 0.0)
+        end
+    end
+    
+    # Final synchronization
+    state.force_densities .= Vector(cache.q_gpu)
     return state
+end
+
+function extract_admm_targets!(problem::OptimizationProblem, cache::FDMCache)
+    m = problem.topology.num_edges
+    l_min = fill(0.0, m)
+    l_max = fill(1e10, m)
+    f_target = fill(-1.0, m)
+    
+    for obj in problem.parameters.objectives
+        if obj isa MinLengthObjective
+            l_min[obj.edge_indices] .= max.(l_min[obj.edge_indices], obj.threshold)
+        elseif obj isa MaxLengthObjective
+            l_max[obj.edge_indices] .= min.(l_max[obj.edge_indices], obj.threshold)
+        elseif obj isa TargetLengthObjective
+            l_min[obj.edge_indices] .= obj.target
+            l_max[obj.edge_indices] .= obj.target
+        elseif obj isa MinForceObjective
+            # Force targets are handled via length adjustments in the kernel if needed, 
+            # but here we can set a target force if we want the kernel to prioritize it.
+            f_target[obj.edge_indices] .= max.(f_target[obj.edge_indices], obj.threshold)
+        end
+    end
+    
+    copyto!(cache.l_min_consolidated, l_min)
+    copyto!(cache.l_max_consolidated, l_max)
+    copyto!(cache.f_target_consolidated, f_target)
 end

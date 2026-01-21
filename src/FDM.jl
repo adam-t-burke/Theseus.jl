@@ -96,6 +96,7 @@ function initialize_fdm_cache(problem::OptimizationProblem)
     # Initialize LinearSolve integrator
     b = zeros(Float64, size(Cn, 2), 3)
     temp_M3 = zeros(Float64, topo.num_edges, 3)
+    q_cpu = zeros(Float64, topo.num_edges)
     prob = LinearProblem(A, b)
     integrator = init(prob, LDLFactorizations.LDLFactorization())
     
@@ -112,6 +113,7 @@ function initialize_fdm_cache(problem::OptimizationProblem)
     dL_gpu = CUDA.zeros(Float64, M, 1)
     dF_gpu = CUDA.zeros(Float64, M, 1)
     λ_free_gpu = CUDA.zeros(Float64, size(Cn, 2), 3)
+    reactions_gpu = CUDA.zeros(Float64, size(Cf, 2), 3)
     
     # Topology on GPU
     # edge_nodes as (M, 2)
@@ -136,27 +138,39 @@ function initialize_fdm_cache(problem::OptimizationProblem)
     x_prev_gpu = CUDA.zeros(Float64, N, 3)
     g_prev_gpu = CUDA.zeros(Float64, N, 3)
     
-    # ADMM Buffers
-    z_gpu = CUDA.zeros(Float64, M, 3)
-    y_gpu = CUDA.zeros(Float64, M, 3)
+    # Consensus Buffers (ADMM)
+    z_consensus = CUDA.zeros(Float64, M, 3)
+    y_dual = CUDA.zeros(Float64, M, 3)
+    l_min = CUDA.zeros(Float64, M, 1)
+    l_max = CUDA.zeros(Float64, M, 1)
+    f_target = CUDA.zeros(Float64, M, 1)
     
     # Node indices on GPU
     free_node_indices_gpu = CuArray{Int32}(topo.free_node_indices)
+    fixed_node_indices_gpu = CuArray{Int32}(topo.fixed_node_indices)
+    
+    fixed_node_to_fixed_idx_cpu = zeros(Int32, N)
+    for (i, node_idx) in enumerate(topo.fixed_node_indices)
+        fixed_node_to_fixed_idx_cpu[node_idx] = Int32(i)
+    end
+    fixed_node_to_fixed_idx_gpu = CuArray(fixed_node_to_fixed_idx_cpu)
     
     return FDMCache(
-        A, integrator, q_to_nz, diag_nz_indices, b, temp_M3,
-        x_gpu, λ_gpu, L_gpu, F_gpu, q_gpu, dq_gpu, dL_gpu, dF_gpu, λ_free_gpu,
-        edge_nodes_gpu, free_node_indices_gpu, color_groups,
-        x_prev_gpu, g_prev_gpu, z_gpu, y_gpu
+        A, integrator, q_to_nz, diag_nz_indices, b, temp_M3, q_cpu,
+        x_gpu, λ_gpu, L_gpu, F_gpu, q_gpu, dq_gpu, dL_gpu, dF_gpu, λ_free_gpu, reactions_gpu,
+        edge_nodes_gpu, free_node_indices_gpu, fixed_node_indices_gpu, fixed_node_to_fixed_idx_gpu, color_groups,
+        x_prev_gpu, g_prev_gpu, z_consensus, y_dual,
+        l_min, l_max, f_target,
+        Dict{AbstractObjective, CuArray}()
     )
 end
 
 """
-    solve_fdm!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
+    solve_fdm!(problem::OptimizationProblem, q::AbstractVector{Float64}, variable_anchor_positions::AbstractMatrix{Float64}, cache::FDMCache)
 
-In-place FDM solver reusing CPU factorization.
+In-place FDM solver reusing CPU factorization and syncing result to GPU.
 """
-function solve_fdm!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
+function solve_fdm!(problem::OptimizationProblem, q::AbstractVector{Float64}, variable_anchor_positions::AbstractMatrix{Float64}, cache::FDMCache)
     # 1. Update A in-place
     cache.A.nzval .= 0.0
     for i in 1:length(q)
@@ -172,7 +186,7 @@ function solve_fdm!(cache::FDMCache, q::AbstractVector{Float64}, problem::Optimi
 
     # 2. Update b = Pn - Cn' * Cfq * Nf
     topo = problem.topology
-    fixed_pos = current_fixed_positions(problem, zeros(0,3))
+    fixed_pos = current_fixed_positions(problem, variable_anchor_positions)
     
     # Calculate Cf * Nf -> temp_M3 (M, 3)
     cache.temp_M3 .= 0.0
@@ -213,12 +227,27 @@ function solve_fdm!(cache::FDMCache, q::AbstractVector{Float64}, problem::Optimi
         end
     end
 
-    # 3. Solve Ax = b
-    # LinearSolve.solve! handles reusing factorization if A's structure hasn't changed.
-    # LDLFactorizations will reuse symbolic factorization.
+    # 3. Solve Ax = b on CPU
     solve!(cache.integrator)
     
-    return cache.integrator.u # (N_free, 3)
+    # 4. Sync Result to GPU
+    # a) Update fixed nodes in x_gpu (variable anchors may have moved)
+    fixed_pos_gpu = CuArray(fixed_pos)
+    threads = 256 # multiple of 32 (warp size), good balance of occupancy and resource usage
+    blocks_fixed = ceil(Int, length(topo.fixed_node_indices) / threads)
+    @cuda threads=threads blocks=blocks_fixed kernel_update_fixed_nodes!(
+        cache.x_gpu, fixed_pos_gpu, cache.fixed_node_indices_gpu
+    )
+    
+    # b) Scatter solved free nodes to x_gpu
+    # cache.integrator.u is (N_free, 3) on CPU
+    x_free_gpu = CuArray(cache.integrator.u)
+    blocks_free = ceil(Int, length(topo.free_node_indices) / threads)
+    @cuda threads=threads blocks=blocks_free kernel_scatter_x!(
+        cache.x_gpu, x_free_gpu, cache.free_node_indices_gpu
+    )
+    
+    return cache.integrator.u
 end
 
 ```

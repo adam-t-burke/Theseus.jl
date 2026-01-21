@@ -7,6 +7,8 @@ using LDLFactorizations
 
 const DEFAULT_BARRIER_SHARPNESS = 10.0
 
+abstract type AbstractObjective end
+
 struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
     xyz_free::TF
     xyz_fixed::TX
@@ -24,6 +26,7 @@ mutable struct FDMCache{TA, TInt, TQNZ, TGPU, TColor, TCPU, TDIAG, TIdx}
     diag_nz_indices::TDIAG
     b::TCPU # (N_free, 3) RHS
     temp_M3::TCPU # (M, 3)
+    q_cpu::Vector{Float64} # Pre-allocated q for CPU interaction
     
     # GPU Buffers
     x_gpu::TGPU # (N_total, 3)
@@ -35,22 +38,33 @@ mutable struct FDMCache{TA, TInt, TQNZ, TGPU, TColor, TCPU, TDIAG, TIdx}
     dL_gpu::TGPU # (M, 1)
     dF_gpu::TGPU # (M, 1)
     λ_free_gpu::TGPU # (N_free, 3)
+    reactions_gpu::TGPU # (N_fixed, 3) Reaction forces at anchors
     
     # Topology & Coloring
     edge_nodes::CuArray{Int32, 2}
     free_node_indices_gpu::TIdx
+    fixed_node_indices_gpu::TIdx
+    fixed_node_to_fixed_idx_gpu::TIdx
     color_groups::TColor
     
     # Anderson Acceleration Buffers
     x_prev_gpu::TGPU
     g_prev_gpu::TGPU
 
-    # ADMM Buffers
-    z_gpu::TGPU # (M, 3) Consensus edge vectors
-    y_gpu::TGPU # (M, 3) Dual variables
-end
+    # Consensus Projections (Synthesized state for ADMM global search)
+    # Physics-based constraints are consolidated into these vectors to allow
+    # high-performance, single-kernel geometric projections.
+    z_consensus::TGPU            # (M, 3) Consensus edge vectors
+    y_dual::TGPU                 # (M, 3) Dual variables
+    l_min_consolidated::TGPU     # (M, 1) Consolidated minimum lengths
+    l_max_consolidated::TGPU     # (M, 1) Consolidated maximum lengths
+    f_target_consolidated::TGPU  # (M, 1) Consolidated target forces
 
-abstract type AbstractObjective end
+    # Objective-Specific Targets (Cached GPU data for energy penalties)
+    # Stores pre-uploaded data (Target XYZ points, Reaction directions, etc).
+    # Keys are (objective, field_symbol); values are CuArrays.
+    objective_targets::Dict{Any, CuArray} 
+end
 
 Base.@kwdef struct TargetXYZObjective <: AbstractObjective
     weight::Float64

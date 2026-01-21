@@ -53,6 +53,38 @@ function kernel_compute_edge_gradients!(x, lambda, edge_nodes, dq)
 end
 
 """
+    kernel_update_fixed_nodes!(x_full, fixed_pos, fixed_indices)
+
+Copy fixed node positions from a dense Matrix to the full nodal buffer.
+"""
+function kernel_update_fixed_nodes!(x_full, fixed_pos, fixed_indices)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx <= length(fixed_indices)
+        node_idx = Int(fixed_indices[idx])
+        x_full[node_idx, 1] = fixed_pos[idx, 1]
+        x_full[node_idx, 2] = fixed_pos[idx, 2]
+        x_full[node_idx, 3] = fixed_pos[idx, 3]
+    end
+    return nothing
+end
+
+"""
+    kernel_scatter_x!(x_full, x_free, free_indices)
+
+Scatter free node positions to the full nodal buffer.
+"""
+function kernel_scatter_x!(x_full, x_free, free_indices)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx <= length(free_indices)
+        node_idx = Int(free_indices[idx])
+        x_full[node_idx, 1] = x_free[idx, 1]
+        x_full[node_idx, 2] = x_free[idx, 2]
+        x_full[node_idx, 3] = x_free[idx, 3]
+    end
+    return nothing
+end
+
+"""
     kernel_scatter_lambda!(lambda_full, lambda_free, free_indices)
 
 Scatter free node sensitivities to the full nodal sensitivity buffer.
@@ -138,6 +170,86 @@ function kernel_admm_z_update!(x, edge_nodes, y, z, L_min, L_max, F_target, q)
         z[idx, 1] = rhs_x * scale
         z[idx, 2] = rhs_y * scale
         z[idx, 3] = rhs_z * scale
+    end
+    return nothing
+end
+
+"""
+    kernel_admm_dual_q_update!(x, edge_nodes, z, y, q, rho)
+
+Update dual variables and force densities.
+`y = y + (x_u - x_v) - z`
+`q = scale * q` (heuristic)
+"""
+function kernel_admm_dual_q_update!(x, edge_nodes, z, y, q, rho)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx <= size(edge_nodes, 1)
+        u = Int(edge_nodes[idx, 1])
+        v = Int(edge_nodes[idx, 2])
+        
+        dx = x[u, 1] - x[v, 1]
+        dy = x[u, 2] - x[v, 2]
+        dz = x[u, 3] - x[v, 3]
+        
+        # Dual update: y = y + (Δx - z)
+        y[idx, 1] += (dx - z[idx, 1])
+        y[idx, 2] += (dy - z[idx, 2])
+        y[idx, 3] += (dz - z[idx, 3])
+        
+        # Force density update (Heuristic consensus)
+        dist = sqrt(dx*dx + dy*dy + dz*dz)
+        target_dist = sqrt(z[idx,1]^2 + z[idx,2]^2 + z[idx,3]^2)
+        
+        # Update q such that q*dist moves towards target tension
+        # This is a relaxed update to maintain stability
+        q[idx] = q[idx] * (0.8 + 0.2 * (target_dist / max(dist, 1e-6)))
+    end
+    return nothing
+end
+
+"""
+    kernel_compute_reactions!(reactions, x, edge_nodes, q, fixed_node_to_fixed_idx)
+
+Compute reaction forces at fixed nodes.
+`reactions`: (N_fixed, 3) output.
+`x`: (N_total, 3) positions.
+`edge_nodes`: (M, 2) connectivity.
+`q`: (M, 1) force densities.
+`fixed_node_to_fixed_idx`: (N_total, 1) mapping from global node index to fixed block index (0 if free).
+"""
+function kernel_compute_reactions!(reactions, x, edge_nodes, q, fixed_node_to_fixed_idx)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx <= size(edge_nodes, 1)
+        u = Int(edge_nodes[idx, 1])
+        v = Int(edge_nodes[idx, 2])
+        
+        q_i = q[idx]
+        dx = q_i * (x[u, 1] - x[v, 1])
+        dy = q_i * (x[u, 2] - x[v, 2])
+        dz = q_i * (x[u, 3] - x[v, 3])
+        
+        # If u is fixed, reaction at u gets -axial_vector
+        idx_u = Int(fixed_node_to_fixed_idx[u])
+        if idx_u > 0
+            CUDA.@atomic reactions[idx_u, 1] -= dx
+            CUDA.@atomic reactions[idx_u, 2] -= dy
+            CUDA.@atomic reactions[idx_u, 3] -= dz
+        end
+        
+        # If v is fixed, reaction at v gets +axial_vector (since it's at v)
+        # Wait, the incidence matrix C_ij is 1 at u and -1 at v.
+        # Edge vector is (x_u - x_v).
+        # axial_vector = q_i * (x_u - x_v).
+        # R = -C' * axial_vector.
+        # R_u = -C_iu * axial_vector = -1 * (q_i * (x_u - x_v)) = -q_i(x_u - x_v).
+        # R_v = -C_iv * axial_vector = -(-1) * (q_i * (x_u - x_v)) = +q_i(x_u - x_v).
+        
+        idx_v = Int(fixed_node_to_fixed_idx[v])
+        if idx_v > 0
+            CUDA.@atomic reactions[idx_v, 1] += dx
+            CUDA.@atomic reactions[idx_v, 2] += dy
+            CUDA.@atomic reactions[idx_v, 3] += dz
+        end
     end
     return nothing
 end
