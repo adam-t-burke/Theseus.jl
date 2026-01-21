@@ -1,3 +1,2 @@
-isderiving() = false
-
-@adjoint isderiving() = true, _ -> nothing  
+# isderiving() = false
+# @adjoint isderiving() = true, _ -> nothing  

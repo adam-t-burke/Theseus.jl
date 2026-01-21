@@ -149,6 +149,114 @@ struct OptimizationProblem
     parameters::OptimizationParameters
 end
 
+mutable struct FDMCache
+    # CPU Solver
+    A::SparseMatrixCSC{Float64, Int64}
+    integrator::Any
+    q_to_nz::Vector{Vector{Int}} # maps edge index -> indices in A.nzval
+
+    # Buffers (primal)
+    x::Matrix{Float64}
+    λ::Matrix{Float64}
+    grad_x::Matrix{Float64}
+    q::Vector{Float64}
+    grad_q::Vector{Float64}
+
+    # Mooncake Shadow Buffers (fdata)
+    x_fdata::Matrix{Float64}
+    λ_fdata::Matrix{Float64}
+    grad_x_fdata::Matrix{Float64}
+    q_fdata::Vector{Float64}
+    grad_q_fdata::Vector{Float64}
+
+    function FDMCache(problem::OptimizationProblem)
+        topo = problem.topology
+        Cn = topo.free_incidence
+        ne = topo.num_edges
+        nn_free = length(topo.free_node_indices)
+
+        # 1. Construct sparsity pattern for A = Cn' * diag(q) * Cn
+        # A_ij is non-zero if nodes i and j share an edge.
+        # We use Int64 for sparse indexing as per specification.
+        I = Int64[]
+        J = Int64[]
+        V = Float64[]
+        
+        # Mapping from edge to nzval indices
+        q_to_nz = [Int[] for _ in 1:ne]
+        
+        # Pre-build the sparse matrix with placeholder values to get nzval structure
+        # We'll use a dummy q=1.0 for all edges
+        row_indices, col_indices = findnz(Cn)
+        # For each edge k, it connects node row_indices[k]
+        # Wait, Cn is edges x nodes.
+        # Cn[k, i] is non-zero if edge k is incident to free node i.
+        
+        # Let's use a more robust way to find the nzval indices
+        # We'll build A once and then find which q_k maps to which index.
+        # Diagonal entries (i, i): sum of q_k for all edges k incident to node i.
+        # Off-diagonal entries (i, j): -q_k if edge k connects free nodes i and j.
+        
+        # Better: use the incidence matrix structure
+        # A = Cn' * Cn (if all q=1)
+        A_template = sparse(convert(SparseMatrixCSC{Float64, Int64}, Cn' * Cn))
+        nz = nnz(A_template)
+        A = SparseMatrixCSC{Float64, Int64}(A_template.m, A_template.n, A_template.colptr, A_template.rowval, zeros(nz))
+        
+        # Identify mapping
+        # For each edge k, find its free nodes
+        for k in 1:ne
+            nodes = findall(!iszero, Cn[k, :])
+            if length(nodes) == 2 # edge between two free nodes
+                n1, n2 = nodes
+                # Add to (n1, n1), (n2, n2), (n1, n2), (n2, n1)
+                push!(q_to_nz[k], find_nz_index(A, n1, n1))
+                push!(q_to_nz[k], find_nz_index(A, n2, n2))
+                push!(q_to_nz[k], find_nz_index(A, n1, n2))
+                push!(q_to_nz[k], find_nz_index(A, n2, n1))
+            elseif length(nodes) == 1 # edge between one free node and one fixed node
+                n1 = nodes[1]
+                # Add only to (n1, n1)
+                push!(q_to_nz[k], find_nz_index(A, n1, n1))
+            end
+        end
+
+        # 2. Initialize LinearSolve integrator
+        # We solve A * x = RHS. 
+        rhs = zeros(nn_free, 3)
+        prob = LinearSolve.LinearProblem(A, rhs)
+        # We use LDLFactorizations for the solver
+        integrator = LinearSolve.init(prob, LinearSolve.LDLtFactorization())
+
+        # 3. Pre-allocate buffers
+        x = zeros(nn_free, 3)
+        λ = zeros(nn_free, 3)
+        grad_x = zeros(nn_free, 3)
+        q = zeros(ne)
+        grad_q = zeros(ne)
+
+        x_fdata = zeros(nn_free, 3)
+        λ_fdata = zeros(nn_free, 3)
+        grad_x_fdata = zeros(nn_free, 3)
+        q_fdata = zeros(ne)
+        grad_q_fdata = zeros(ne)
+
+        new(A, integrator, q_to_nz, 
+            x, λ, grad_x, q, grad_q,
+            x_fdata, λ_fdata, grad_x_fdata, q_fdata, grad_q_fdata)
+    end
+end
+
+# Helper to find nz index in SparseMatrixCSC
+function find_nz_index(A::SparseMatrixCSC, i::Integer, j::Integer)
+    for nz_idx in A.colptr[j]:(A.colptr[j+1]-1)
+        if A.rowval[nz_idx] == i
+            return nz_idx
+        end
+    end
+    error("Index ($i, $j) not found in sparse matrix")
+end
+
 mutable struct OptimizationState
     force_densities::Vector{Float64}
     variable_anchor_positions::Matrix{Float64}
