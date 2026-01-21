@@ -20,8 +20,8 @@ function __init__()
     end
 end
 
-include("FDM.jl")
 include("types.jl")
+include("FDM.jl")
 include("optimization.jl")
 include("analysis.jl")
 include("communication.jl")

@@ -153,7 +153,14 @@ mutable struct FDMCache
     # CPU Solver
     A::SparseMatrixCSC{Float64, Int64}
     integrator::Any
-    q_to_nz::Vector{Vector{Int}} # maps edge index -> indices in A.nzval
+    q_to_nz::Vector{Vector{Tuple{Int, Float64}}} # maps edge index -> indices and coeffs in A.nzval
+    edge_starts::Vector{Int} # node index (1..nn)
+    edge_ends::Vector{Int}   # node index (1..nn)
+    node_to_free_idx::Vector{Int} # node index (1..nn) -> index in Cn (0 if fixed)
+
+    # Constant topology buffers
+    Cn::SparseMatrixCSC{Float64, Int64}
+    Cf::SparseMatrixCSC{Float64, Int64}
 
     # Buffers (primal)
     x::Matrix{Float64}
@@ -161,6 +168,12 @@ mutable struct FDMCache
     grad_x::Matrix{Float64}
     q::Vector{Float64}
     grad_q::Vector{Float64}
+    
+    # Intermediate buffers for RHS
+    Cf_Nf::Matrix{Float64}
+    Q_Cf_Nf::Matrix{Float64}
+    Pn::Matrix{Float64}
+    Nf::Matrix{Float64} # Buffer for current fixed node positions
 
     # Mooncake Shadow Buffers (fdata)
     x_fdata::Matrix{Float64}
@@ -171,62 +184,81 @@ mutable struct FDMCache
 
     function FDMCache(problem::OptimizationProblem)
         topo = problem.topology
-        Cn = topo.free_incidence
+        Cn = convert(SparseMatrixCSC{Float64, Int64}, topo.free_incidence)
+        Cf = convert(SparseMatrixCSC{Float64, Int64}, topo.fixed_incidence)
         ne = topo.num_edges
         nn_free = length(topo.free_node_indices)
 
         # 1. Construct sparsity pattern for A = Cn' * diag(q) * Cn
-        # A_ij is non-zero if nodes i and j share an edge.
-        # We use Int64 for sparse indexing as per specification.
-        I = Int64[]
-        J = Int64[]
-        V = Float64[]
-        
-        # Mapping from edge to nzval indices
-        q_to_nz = [Int[] for _ in 1:ne]
-        
-        # Pre-build the sparse matrix with placeholder values to get nzval structure
-        # We'll use a dummy q=1.0 for all edges
-        row_indices, col_indices = findnz(Cn)
-        # For each edge k, it connects node row_indices[k]
-        # Wait, Cn is edges x nodes.
-        # Cn[k, i] is non-zero if edge k is incident to free node i.
-        
-        # Let's use a more robust way to find the nzval indices
-        # We'll build A once and then find which q_k maps to which index.
-        # Diagonal entries (i, i): sum of q_k for all edges k incident to node i.
-        # Off-diagonal entries (i, j): -q_k if edge k connects free nodes i and j.
-        
-        # Better: use the incidence matrix structure
-        # A = Cn' * Cn (if all q=1)
-        A_template = sparse(convert(SparseMatrixCSC{Float64, Int64}, Cn' * Cn))
+        A_template = sparse(Cn' * Cn)
         nz = nnz(A_template)
         A = SparseMatrixCSC{Float64, Int64}(A_template.m, A_template.n, A_template.colptr, A_template.rowval, zeros(nz))
         
-        # Identify mapping
-        # For each edge k, find its free nodes
+        # Mapping from edge to nzval indices
+        q_to_nz = [Tuple{Int, Float64}[] for _ in 1:ne]
+        edge_starts = zeros(Int, ne)
+        edge_ends = zeros(Int, ne)
+        node_to_free_idx = zeros(Int, topo.num_nodes)
+        for (i, node_idx) in enumerate(topo.free_node_indices)
+            node_to_free_idx[node_idx] = i
+        end
+
+        # Pre-process incidence to get nodes of each edge
+        incidence = problem.topology.incidence
         for k in 1:ne
-            nodes = findall(!iszero, Cn[k, :])
-            if length(nodes) == 2 # edge between two free nodes
-                n1, n2 = nodes
-                # Add to (n1, n1), (n2, n2), (n1, n2), (n2, n1)
-                push!(q_to_nz[k], find_nz_index(A, n1, n1))
-                push!(q_to_nz[k], find_nz_index(A, n2, n2))
-                push!(q_to_nz[k], find_nz_index(A, n1, n2))
-                push!(q_to_nz[k], find_nz_index(A, n2, n1))
-            elseif length(nodes) == 1 # edge between one free node and one fixed node
-                n1 = nodes[1]
-                # Add only to (n1, n1)
-                push!(q_to_nz[k], find_nz_index(A, n1, n1))
+            # find -1 and 1 in row k
+            # Since incidence is CSC, we might need to transpose or search
+            # But the user's topology probably has it stored somehow.
+            # Let's just find the indices.
+        end
+        # Finding in CSC (ne x nn): Search all cols for row k
+        # Faster: Convert to CSR or just use the topology data
+        for col in 1:topo.num_nodes
+            for idx in incidence.colptr[col]:(incidence.colptr[col+1]-1)
+                row = incidence.rowval[idx]
+                val = incidence.nzval[idx]
+                if val == -1.0
+                    edge_starts[row] = col
+                elseif val == 1.0
+                    edge_ends[row] = col
+                end
+            end
+        end
+
+        # Pre-process Cn to get nodes of each edge
+        edge_to_nodes = [Int[] for _ in 1:ne]
+        for j in 1:nn_free
+            for idx in Cn.colptr[j]:(Cn.colptr[j+1]-1)
+                push!(edge_to_nodes[Cn.rowval[idx]], j)
+            end
+        end
+
+        for k in 1:ne
+            nodes = edge_to_nodes[k]
+            for n1 in nodes
+                # find Cn[k, n1]
+                val_n1 = 0.0
+                for idx in Cn.colptr[n1]:(Cn.colptr[n1+1]-1)
+                    if Cn.rowval[idx] == k; val_n1 = Cn.nzval[idx]; break; end
+                end
+                for n2 in nodes
+                    # find Cn[k, n2]
+                    val_n2 = 0.0
+                    for idx in Cn.colptr[n2]:(Cn.colptr[n2+1]-1)
+                        if Cn.rowval[idx] == k; val_n2 = Cn.nzval[idx]; break; end
+                    end
+                    nz_idx = find_nz_index(A, n1, n2)
+                    push!(q_to_nz[k], (nz_idx, val_n1 * val_n2))
+                end
             end
         end
 
         # 2. Initialize LinearSolve integrator
-        # We solve A * x = RHS. 
         rhs = zeros(nn_free, 3)
-        prob = LinearSolve.LinearProblem(A, rhs)
-        # We use LDLFactorizations for the solver
-        integrator = LinearSolve.init(prob, LinearSolve.LDLtFactorization())
+        u0 = zeros(nn_free, 3)
+        prob = LinearSolve.LinearProblem(A, rhs; u0 = u0)
+        # Using UMFPACK for robustness with SparseMatrixCSC
+        integrator = LinearSolve.init(prob, LinearSolve.UMFPACKFactorization())
 
         # 3. Pre-allocate buffers
         x = zeros(nn_free, 3)
@@ -234,6 +266,11 @@ mutable struct FDMCache
         grad_x = zeros(nn_free, 3)
         q = zeros(ne)
         grad_q = zeros(ne)
+        
+        Cf_Nf = zeros(ne, 3)
+        Q_Cf_Nf = zeros(ne, 3)
+        Pn = copy(problem.loads.free_node_loads)
+        Nf = zeros(topo.num_nodes, 3)
 
         x_fdata = zeros(nn_free, 3)
         λ_fdata = zeros(nn_free, 3)
@@ -241,8 +278,10 @@ mutable struct FDMCache
         q_fdata = zeros(ne)
         grad_q_fdata = zeros(ne)
 
-        new(A, integrator, q_to_nz, 
+        new(A, integrator, q_to_nz, edge_starts, edge_ends,
+            Cn, Cf,
             x, λ, grad_x, q, grad_q,
+            Cf_Nf, Q_Cf_Nf, Pn, Nf,
             x_fdata, λ_fdata, grad_x_fdata, q_fdata, grad_q_fdata)
     end
 end
@@ -277,19 +316,22 @@ end
 
 default_bounds(ne::Int) = Bounds(fill(1e-8, ne), fill(Inf, ne))
 
-function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
+function current_fixed_positions!(dest::AbstractMatrix{T}, problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real}) where T
     anchor = problem.anchors
     ref = anchor.reference_positions
-    T = promote_type(eltype(ref), eltype(anchor_positions))
-    if isempty(anchor.variable_indices)
-        return T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
-    end
-    positions = T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
+    
+    # 1. Start with reference positions
+    copyto!(dest, ref)
+    
+    # 2. Overlay variable anchors
     if !isempty(anchor.variable_indices)
-        anchors_converted = eltype(anchor_positions) === T ? anchor_positions : convert(Matrix{T}, anchor_positions)
-        positions[anchor.variable_indices, :] .= anchors_converted
+        for dim in 1:3
+            for (i, node_idx) in enumerate(anchor.variable_indices)
+                dest[node_idx, dim] = anchor_positions[i, dim]
+            end
+        end
     end
-    return positions
+    return dest
 end
 
 current_fixed_positions(problem::OptimizationProblem, state::OptimizationState) =
