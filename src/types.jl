@@ -1,8 +1,54 @@
 using JSON3
 using SparseArrays
 using LinearAlgebra
+using CUDA
+using LinearSolve
+using LDLFactorizations
 
 const DEFAULT_BARRIER_SHARPNESS = 10.0
+
+struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
+    xyz_free::TF
+    xyz_fixed::TX
+    xyz_full::TA
+    member_lengths::VL
+    member_forces::VF
+    reactions::TR
+end
+
+mutable struct FDMCache{TA, TInt, TQNZ, TGPU, TColor, TCPU, TDIAG, TIdx}
+    # CPU Buffers
+    A::TA
+    integrator::TInt
+    q_to_nz::TQNZ
+    diag_nz_indices::TDIAG
+    b::TCPU # (N_free, 3) RHS
+    temp_M3::TCPU # (M, 3)
+    
+    # GPU Buffers
+    x_gpu::TGPU # (N_total, 3)
+    λ_gpu::TGPU # (N_total, 3)
+    L_gpu::TGPU # (M, 1)
+    F_gpu::TGPU # (M, 1)
+    q_gpu::TGPU # (M, 1)
+    dq_gpu::TGPU # (M, 1)
+    dL_gpu::TGPU # (M, 1)
+    dF_gpu::TGPU # (M, 1)
+    λ_free_gpu::TGPU # (N_free, 3)
+    
+    # Topology & Coloring
+    edge_nodes::CuArray{Int32, 2}
+    free_node_indices_gpu::TIdx
+    color_groups::TColor
+    
+    # Anderson Acceleration Buffers
+    x_prev_gpu::TGPU
+    g_prev_gpu::TGPU
+
+    # ADMM Buffers
+    z_gpu::TGPU # (M, 3) Consensus edge vectors
+    y_gpu::TGPU # (M, 3) Dual variables
+end
 
 abstract type AbstractObjective end
 
@@ -100,6 +146,10 @@ struct SolverOptions
     barrier_weight::Float64
     barrier_sharpness::Float64
     use_auto_scaling::Bool
+    use_admm::Bool
+    use_lbfgs::Bool
+    admm_iterations::Int
+    rho::Float64
 end
 
 struct TracingOptions
@@ -156,9 +206,10 @@ mutable struct OptimizationState
     penalty_trace::Vector{Float64}
     node_trace::Vector{Matrix{Float64}}
     iterations::Int
+    cache::Union{Nothing, FDMCache}
 end
 
-OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Float64[], Matrix{Float64}[], 0)
+OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Float64[], Matrix{Float64}[], 0, nothing)
 
 struct ObjectiveContext
     num_edges::Int
@@ -351,7 +402,12 @@ function parse_solver_options(parameters_json::JSON3.Object)
     barrier_sharpness = haskey(parameters_json, "BarrierSharpness") ? Float64(parameters_json["BarrierSharpness"]) : DEFAULT_BARRIER_SHARPNESS
     auto_scale = haskey(parameters_json, "AutoScale") ? Bool(parameters_json["AutoScale"]) : true
     
-    SolverOptions(abs_tol, rel_tol, max_iter, freq, show, barrier_weight, barrier_sharpness, auto_scale)
+    use_admm = haskey(parameters_json, "UseADMM") ? Bool(parameters_json["UseADMM"]) : true
+    use_lbfgs = haskey(parameters_json, "UseLBFGS") ? Bool(parameters_json["UseLBFGS"]) : true
+    admm_iter = haskey(parameters_json, "ADMMIterations") ? Int(parameters_json["ADMMIterations"]) : 100
+    rho = haskey(parameters_json, "Rho") ? Float64(parameters_json["Rho"]) : 1.0
+
+    SolverOptions(abs_tol, rel_tol, max_iter, freq, show, barrier_weight, barrier_sharpness, auto_scale, use_admm, use_lbfgs, admm_iter, rho)
 end
 
 function parse_tracing_options(parameters_json::JSON3.Object)
@@ -444,7 +500,7 @@ end
 
 function build_parameters(problem::JSON3.Object, topo::NetworkTopology)
     if !haskey(problem, "Parameters")
-        return OptimizationParameters(AbstractObjective[], default_bounds(topo.num_edges), SolverOptions(1e-6, 1e-6, 1, 1, false, 1000.0, DEFAULT_BARRIER_SHARPNESS, true), TracingOptions(false, 1))
+        return OptimizationParameters(AbstractObjective[], default_bounds(topo.num_edges), SolverOptions(1e-6, 1e-6, 1, 1, false, 1000.0, DEFAULT_BARRIER_SHARPNESS, true, true, true, 100, 1.0), TracingOptions(false, 1))
     end
 
     params_json = problem["Parameters"]

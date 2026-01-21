@@ -1,6 +1,225 @@
-#######
-# contains functions for analyzing an FDM network
-#######
+using SparseArrays
+using LinearAlgebra
+using CUDA
+using LinearSolve
+using LDLFactorizations
+using SparseDiffTools
+using Graphs
+
+"""
+    find_nz_index(A::SparseMatrixCSC, row::Int, col::Int)
+
+Find the index in `A.nzval` corresponding to the entry `(row, col)`.
+"""
+function find_nz_index(A::SparseMatrixCSC, row::Int, col::Int)
+    for idx in A.colptr[col]:(A.colptr[col+1]-1)
+        if A.rowval[idx] == row
+            return idx
+        end
+    end
+    error("Index ($row, $col) not found in sparse matrix")
+end
+
+"""
+    compute_q_to_nz(Cn::SparseMatrixCSC, A::SparseMatrixCSC)
+
+Identify which indices in `A.nzval` are updated by each force density `q_i`.
+Each force density `q_i` for edge `i` (connecting nodes `u` and `v`) contributes to:
+- `A[u, u]` and `A[v, v]` (if `u`, `v` are free)
+- `A[u, v]` and `A[v, u]` (if both `u` and `v` are free)
+"""
+function compute_q_to_nz(Cn::SparseMatrixCSC, A::SparseMatrixCSC)
+    num_edges = size(Cn, 1)
+    q_to_nz = [Int32[] for _ in 1:num_edges]
+    
+    # iterate over each edge
+    for i in 1:num_edges
+        nz_indices = Cn[i, :].nzind
+        # Edge i connects free nodes nodes[nz_indices]
+        for (idx_u, u) in enumerate(nz_indices)
+            push!(q_to_nz[i], Int32(find_nz_index(A, u, u)))
+            for v in nz_indices[idx_u+1:end]
+                push!(q_to_nz[i], Int32(find_nz_index(A, u, v)))
+                push!(q_to_nz[i], Int32(find_nz_index(A, v, u)))
+            end
+        end
+    end
+    return q_to_nz
+end
+
+"""
+    compute_edge_coloring(incidence::SparseMatrixCSC)
+
+Perform edge coloring to ensure no two edges in a color group share a node.
+Used for race-free parallel writes to nodal buffers.
+"""
+function compute_edge_coloring(incidence::SparseMatrixCSC)
+    num_edges, num_nodes = size(incidence)
+    adj = incidence * incidence' # Edge adjacency via shared nodes (off-diagonals)
+    # diagonal elements are 2 (since each edge has 2 nodes), we need to clear them for SparseDiffTools
+    for i in 1:num_edges
+        adj[i, i] = 0
+    end
+    dropzeros!(adj)
+    colors = matrix_colors(adj)
+    
+    num_colors = maximum(colors)
+    color_groups = [Int32[] for _ in 1:num_colors]
+    for i in 1:num_edges
+        push!(color_groups[colors[i]], Int32(i))
+    end
+    return [CuArray(group) for group in color_groups]
+end
+
+"""
+    initialize_fdm_cache(problem::OptimizationProblem)
+
+Pre-allocate all CPU and GPU buffers for zero-allocation FDM optimization.
+"""
+function initialize_fdm_cache(problem::OptimizationProblem)
+    topo = problem.topology
+    Cn = topo.free_incidence
+    Cf = topo.fixed_incidence
+    
+    # 1. CPU Linear Algebra setup
+    # Initial A = Cn' * Cn (assuming q=1)
+    A = Cn' * Cn
+    # Add a small diagonal shift for stability as per spec
+    for i in 1:size(A, 1)
+        A[i, i] += 1e-9
+    end
+    
+    # Map q_i to A.nzval indices
+    q_to_nz = compute_q_to_nz(Cn, A)
+    diag_nz_indices = [Int32(find_nz_index(A, i, i)) for i in 1:size(A, 1)]
+    
+    # Initialize LinearSolve integrator
+    b = zeros(Float64, size(Cn, 2), 3)
+    temp_M3 = zeros(Float64, topo.num_edges, 3)
+    prob = LinearProblem(A, b)
+    integrator = init(prob, LDLFactorizations.LDLFactorization())
+    
+    # 2. GPU Pre-allocation
+    M = topo.num_edges
+    N = topo.num_nodes
+    
+    x_gpu = CUDA.zeros(Float64, N, 3)
+    λ_gpu = CUDA.zeros(Float64, N, 3)
+    L_gpu = CUDA.zeros(Float64, M, 1)
+    F_gpu = CUDA.zeros(Float64, M, 1)
+    q_gpu = CUDA.zeros(Float64, M, 1)
+    dq_gpu = CUDA.zeros(Float64, M, 1)
+    dL_gpu = CUDA.zeros(Float64, M, 1)
+    dF_gpu = CUDA.zeros(Float64, M, 1)
+    λ_free_gpu = CUDA.zeros(Float64, size(Cn, 2), 3)
+    
+    # Topology on GPU
+    # edge_nodes as (M, 2)
+    edge_nodes_cpu = zeros(Int32, M, 2)
+    rows = rowvals(topo.incidence)
+    for j in 1:N
+        for idx in nzrange(topo.incidence, j)
+            i = rows[idx]
+            if edge_nodes_cpu[i, 1] == 0 # uninitialized
+                edge_nodes_cpu[i, 1] = Int32(j)
+            else
+                edge_nodes_cpu[i, 2] = Int32(j)
+            end
+        end
+    end
+    edge_nodes_gpu = CuArray(edge_nodes_cpu)
+    
+    # Coloring
+    color_groups = compute_edge_coloring(topo.incidence)
+    
+    # Anderson buffers
+    x_prev_gpu = CUDA.zeros(Float64, N, 3)
+    g_prev_gpu = CUDA.zeros(Float64, N, 3)
+    
+    # ADMM Buffers
+    z_gpu = CUDA.zeros(Float64, M, 3)
+    y_gpu = CUDA.zeros(Float64, M, 3)
+    
+    # Node indices on GPU
+    free_node_indices_gpu = CuArray{Int32}(topo.free_node_indices)
+    
+    return FDMCache(
+        A, integrator, q_to_nz, diag_nz_indices, b, temp_M3,
+        x_gpu, λ_gpu, L_gpu, F_gpu, q_gpu, dq_gpu, dL_gpu, dF_gpu, λ_free_gpu,
+        edge_nodes_gpu, free_node_indices_gpu, color_groups,
+        x_prev_gpu, g_prev_gpu, z_gpu, y_gpu
+    )
+end
+
+"""
+    solve_fdm!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
+
+In-place FDM solver reusing CPU factorization.
+"""
+function solve_fdm!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
+    # 1. Update A in-place
+    cache.A.nzval .= 0.0
+    for i in 1:length(q)
+        val = q[i]
+        for nz_idx in cache.q_to_nz[i]
+            cache.A.nzval[nz_idx] += val
+        end
+    end
+    # Add diagonal shift
+    for nz_idx in cache.diag_nz_indices
+        cache.A.nzval[nz_idx] += 1e-9
+    end
+
+    # 2. Update b = Pn - Cn' * Cfq * Nf
+    topo = problem.topology
+    fixed_pos = current_fixed_positions(problem, zeros(0,3))
+    
+    # Calculate Cf * Nf -> temp_M3 (M, 3)
+    cache.temp_M3 .= 0.0
+    Cf = topo.fixed_incidence
+    rows_cf = rowvals(Cf)
+    for j in 1:size(Cf, 2) # fixed nodes
+        pos_j1 = fixed_pos[j, 1]
+        pos_j2 = fixed_pos[j, 2]
+        pos_j3 = fixed_pos[j, 3]
+        for idx in nzrange(Cf, j)
+            i = rows_cf[idx]
+            val = Cf.nzval[idx]
+            cache.temp_M3[i, 1] += val * pos_j1
+            cache.temp_M3[i, 2] += val * pos_j2
+            cache.temp_M3[i, 3] += val * pos_j3
+        end
+    end
+    
+    # Apply q: temp_M3 = q .* (Cf * Nf)
+    for i in 1:topo.num_edges
+        q_i = q[i]
+        cache.temp_M3[i, 1] *= q_i
+        cache.temp_M3[i, 2] *= q_i
+        cache.temp_M3[i, 3] *= q_i
+    end
+    
+    # b = Pn - Cn' * temp_M3
+    Cn = topo.free_incidence
+    cache.b .= problem.loads.free_node_loads
+    rows_cn = rowvals(Cn)
+    for j in 1:size(Cn, 2) # free nodes
+        for idx in nzrange(Cn, j)
+            i = rows_cn[idx]
+            val = Cn.nzval[idx]
+            cache.b[j, 1] -= val * cache.temp_M3[i, 1]
+            cache.b[j, 2] -= val * cache.temp_M3[i, 2]
+            cache.b[j, 3] -= val * cache.temp_M3[i, 3]
+        end
+    end
+
+    # 3. Solve Ax = b
+    # LinearSolve.solve! handles reusing factorization if A's structure hasn't changed.
+    # LDLFactorizations will reuse symbolic factorization.
+    solve!(cache.integrator)
+    
+    return cache.integrator.u # (N_free, 3)
+end
 
 ```
 Explicit solver function
