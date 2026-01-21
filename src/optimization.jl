@@ -1,7 +1,8 @@
 using LinearAlgebra
 using Optim
-using Mooncake
-using ChainRulesCore: ignore_derivatives
+import Mooncake
+import ADTypes
+import DifferentiationInterface
 using Logging
 
 struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
@@ -163,10 +164,10 @@ function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) 
     q, anchors
 end
 
-function form_finding_objective(problem::OptimizationProblem, lb, ub, lb_idx, ub_idx, barrier_weight, sharpness)
+function form_finding_objective(problem::OptimizationProblem, cache::OptimizationCache, lb, ub, lb_idx, ub_idx, barrier_weight, sharpness)
     function objective(θ)
         q, anchors = unpack_parameters(problem, θ)
-        snapshot = evaluate_geometry(problem, q, anchors)
+        snapshot = evaluate_geometry(problem, q, anchors, cache)
         
         geometric_loss = total_loss(problem, q, anchors, snapshot)
         barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)
@@ -188,25 +189,6 @@ function parameter_bounds(problem::OptimizationProblem)
         upper = vcat(upper, fill(Inf, 3nvar))
     end
     lower, upper
-end
-
-function make_gradient(objective)
-    # Pre-build the gradient cache once
-    # θ0 is not known here, but we can initialize it with any value of the same type/shape if needed
-    # Better yet, we can do it inside g! or pass it in.
-    # For now, let's initialize it on the first call or just prepare it here if we had a prototype.
-    
-    # Actually, Mooncake's value_and_gradient!! can be fast if the cache is reused.
-    gradient_cache = Ref{Any}(nothing)
-
-    function g!(G, θ)
-        if gradient_cache[] === nothing
-            gradient_cache[] = Mooncake.prepare_gradient_cache(objective, θ)
-        end
-        _, grad = Mooncake.value_and_gradient!!(gradient_cache[], objective, θ)
-        copyto!(G, grad)
-    end
-    g!
 end
 
 function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
@@ -236,8 +218,21 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
         @warn "Initial guess is outside bounds" num_lower=sum(initial_violations_lower) num_upper=sum(initial_violations_upper)
     end
 
-    objective = form_finding_objective(problem, lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_weight, solver.barrier_sharpness)
-    gradient! = make_gradient(objective)
+    objective = form_finding_objective(problem, state.cache, lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_weight, solver.barrier_sharpness)
+    
+    # Setup Mooncake backend via DifferentiationInterface
+    backend = ADTypes.AutoMooncake(config=Mooncake.Config(friendly_tangents=true))
+    prep = DifferentiationInterface.prepare_gradient(objective, backend, θ0)
+    
+    function fg!(F, G, θ)
+        if G !== nothing
+            val, _ = DifferentiationInterface.value_and_gradient!(objective, G, prep, backend, θ)
+            return val
+        elseif F !== nothing
+            return objective(θ)
+        end
+        return nothing
+    end
     
     callback = function (os)
         state.iterations = os.iteration
@@ -265,8 +260,7 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     end
     
     result = Optim.optimize(
-        objective,
-        gradient!,
+        Optim.only_fg!(fg!),
         θ0,
         LBFGS(),
         Optim.Options(
