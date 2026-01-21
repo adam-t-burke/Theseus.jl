@@ -59,21 +59,21 @@ end
 @testset "Allocation Scaling Test" begin
     # Test case 1: Very Small
     p1 = create_random_fdm_problem(10, 5, 6)
-    c1 = Theseus.FDMCache(p1)
+    c1 = Theseus.OptimizationCache(p1)
     copyto!(c1.q, ones(10))
     Theseus.solve_explicit!(c1, p1, zeros(0,3)) # warm up
     a1 = @allocated Theseus.solve_explicit!(c1, p1, zeros(0,3))
     
     # Test case 2: Larger
     p2 = create_random_fdm_problem(1000, 500, 501)
-    c2 = Theseus.FDMCache(p2)
+    c2 = Theseus.OptimizationCache(p2)
     copyto!(c2.q, ones(1000))
     Theseus.solve_explicit!(c2, p2, zeros(0,3)) # warm up
     a2 = @allocated Theseus.solve_explicit!(c2, p2, zeros(0,3))
     
     # Test case 3: Much Larger
     p3 = create_random_fdm_problem(10000, 5000, 5001)
-    c3 = Theseus.FDMCache(p3)
+    c3 = Theseus.OptimizationCache(p3)
     copyto!(c3.q, ones(10000))
     Theseus.solve_explicit!(c3, p3, zeros(0,3)) # warm up
     a3 = @allocated Theseus.solve_explicit!(c3, p3, zeros(0,3))

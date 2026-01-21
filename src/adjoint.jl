@@ -11,12 +11,12 @@ using Mooncake: NoTangent, @is_primitive, ReverseMode, DefaultCtx, CoDual, NoRDa
 @is_primitive DefaultCtx ReverseMode Tuple{typeof(Theseus.solve_FDM!), Vararg{Any}}
 
 """
-    solve_adjoint!(cache::Theseus.FDMCache, dJ_dx::AbstractMatrix)
+    solve_adjoint!(cache::Theseus.OptimizationCache, dJ_dx::AbstractMatrix)
 
 Solves the adjoint system A^T λ = dJ_dx using the pre-factorized matrix from the forward pass.
 Since A is symmetric (C'QC), we reuse the same factorization.
 """
-function solve_adjoint!(cache::Theseus.FDMCache, dJ_dx::AbstractMatrix)
+function solve_adjoint!(cache::Theseus.OptimizationCache, dJ_dx::AbstractMatrix)
     # Solve A * lambda = dJ_dx
     # We DO NOT update cache.factor here because we want to reuse the 
     # factors already calculated in solve_FDM!. 
@@ -25,13 +25,13 @@ function solve_adjoint!(cache::Theseus.FDMCache, dJ_dx::AbstractMatrix)
 end
 
 """
-    accumulate_gradients!(cache::Theseus.FDMCache, p::Theseus.OptimizationProblem)
+    accumulate_gradients!(cache::Theseus.OptimizationCache, p::Theseus.OptimizationProblem)
 
 Computes the gradient with respect to q and Nf (fixed node positions).
 ∂J/∂q_k = -Δλ_k ⋅ ΔN_k
 ∂J/∂N_v += -q_k * Δλ (if v is fixed)
 """
-function accumulate_gradients!(cache::Theseus.FDMCache, p::Theseus.OptimizationProblem)
+function accumulate_gradients!(cache::Theseus.OptimizationCache, p::Theseus.OptimizationProblem)
     fill!(cache.grad_q, 0.0)
     fill!(cache.grad_Nf, 0.0)
     
@@ -75,7 +75,7 @@ end
 
 function Mooncake.rrule!!(
     f_cd::CoDual{typeof(Theseus.solve_FDM!)},
-    cache_cd::CoDual{<:Theseus.FDMCache},
+    cache_cd::CoDual{<:Theseus.OptimizationCache},
     q_cd::CoDual{<:AbstractVector{<:Real}},
     problem_cd::CoDual{<:Theseus.OptimizationProblem},
     anchors_cd::CoDual{<:Matrix{Float64}}
@@ -87,7 +87,22 @@ function Mooncake.rrule!!(
     out_cd = CoDual(snapshot, cache_cd.dx.fields.x)
 
     function solve_FDM_pullback(dy::NoRData)
-        # dJ/dx is stored in cache_cd.dx.fields.x
+        # 1. Accumulate direct gradients from cache.Nf into solve output and anchors
+        # The objective evaluation (loops) populated cache_cd.dx.fields.Nf
+        free_indices = problem_cd.x.topology.free_node_indices
+        fixed_indices = problem_cd.x.topology.fixed_node_indices
+        
+        # Pull dJ/dNf into dJ/dx_free
+        for j in 1:3
+            for (i, idx) in enumerate(free_indices)
+                cache_cd.dx.fields.x[i, j] += cache_cd.dx.fields.Nf[idx, j]
+                # Zero out Nf shadow so we don't double count if this is called multiple times
+                # (Mooncake pullbacks are usually called once, but good practice)
+                cache_cd.dx.fields.Nf[idx, j] = 0.0
+            end
+        end
+        
+        # dJ/dx is now fully formed in cache_cd.dx.fields.x
         solve_adjoint!(cache, cache_cd.dx.fields.x)
         accumulate_gradients!(cache, problem_cd.x)
         
@@ -97,9 +112,20 @@ function Mooncake.rrule!!(
         var_indices = problem_cd.x.anchors.variable_indices
         for i in 1:length(var_indices)
             idx = var_indices[i]
-            anchors_cd.dx[i, 1] += cache.grad_Nf[idx, 1]
+            # Gradient of solver output w.r.t. this anchor
+            anchors_cd.dx[i, 1] += cache.grad_Nf[idx, 1] 
             anchors_cd.dx[i, 2] += cache.grad_Nf[idx, 2]
             anchors_cd.dx[i, 3] += cache.grad_Nf[idx, 3]
+            
+            # Direct gradient of loss w.r.t. this anchor node 
+            # (e.g. if the node is used in a TargetXYZObjective)
+            anchors_cd.dx[i, 1] += cache_cd.dx.fields.Nf[idx, 1]
+            anchors_cd.dx[i, 2] += cache_cd.dx.fields.Nf[idx, 2]
+            anchors_cd.dx[i, 3] += cache_cd.dx.fields.Nf[idx, 3]
+            
+            cache_cd.dx.fields.Nf[idx, 1] = 0.0
+            cache_cd.dx.fields.Nf[idx, 2] = 0.0
+            cache_cd.dx.fields.Nf[idx, 3] = 0.0
         end
         
         return NoRData(), NoRData(), NoRData(), Mooncake.rdata(Mooncake.zero_tangent(problem_cd.x)), NoRData()
@@ -110,7 +136,7 @@ end
 
 function Mooncake.rrule!!(
     f_cd::CoDual{typeof(Theseus.solve_FDM!)},
-    cache_cd::CoDual{<:Theseus.FDMCache},
+    cache_cd::CoDual{<:Theseus.OptimizationCache},
     q_cd::CoDual{<:AbstractVector{<:Real}},
     problem_cd::CoDual{<:Theseus.OptimizationProblem},
     anchors_cd::CoDual{<:Matrix{Float64}},
@@ -122,6 +148,16 @@ function Mooncake.rrule!!(
     out_cd = CoDual(snapshot, cache_cd.dx.fields.x)
 
     function solve_FDM_pullback_ext(dy::NoRData)
+        free_indices = problem_cd.x.topology.free_node_indices
+        fixed_indices = problem_cd.x.topology.fixed_node_indices
+        
+        for j in 1:3
+            for (i, idx) in enumerate(free_indices)
+                cache_cd.dx.fields.x[i, j] += cache_cd.dx.fields.Nf[idx, j]
+                cache_cd.dx.fields.Nf[idx, j] = 0.0
+            end
+        end
+
         solve_adjoint!(cache, cache_cd.dx.fields.x)
         accumulate_gradients!(cache, problem_cd.x)
         
@@ -133,6 +169,14 @@ function Mooncake.rrule!!(
             anchors_cd.dx[i, 1] += cache.grad_Nf[idx, 1]
             anchors_cd.dx[i, 2] += cache.grad_Nf[idx, 2]
             anchors_cd.dx[i, 3] += cache.grad_Nf[idx, 3]
+
+            anchors_cd.dx[i, 1] += cache_cd.dx.fields.Nf[idx, 1]
+            anchors_cd.dx[i, 2] += cache_cd.dx.fields.Nf[idx, 2]
+            anchors_cd.dx[i, 3] += cache_cd.dx.fields.Nf[idx, 3]
+            
+            cache_cd.dx.fields.Nf[idx, 1] = 0.0
+            cache_cd.dx.fields.Nf[idx, 2] = 0.0
+            cache_cd.dx.fields.Nf[idx, 3] = 0.0
         end
         
         return NoRData(), NoRData(), NoRData(), Mooncake.rdata(Mooncake.zero_tangent(problem_cd.x)), NoRData(), 0.0

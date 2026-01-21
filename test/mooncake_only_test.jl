@@ -54,7 +54,7 @@ println("--- Testing Mooncake integration (Zygote-free) ---")
 problem = create_tiny_problem()
 q_init = [1.0, 1.0]
 state = Theseus.OptimizationState(q_init, problem.anchors.initial_variable_positions)
-state.cache = Theseus.FDMCache(problem)
+state.cache = Theseus.OptimizationCache(problem)
 
 # Define a simple objective function
 function my_objective_logic(θ)

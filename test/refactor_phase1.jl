@@ -4,7 +4,7 @@ using SparseArrays
 using LinearSolve
 using Mooncake
 
-@testset "Refactor Phase 1: Foundation & FDMCache" begin
+@testset "Refactor Phase 1: Foundation & OptimizationCache" begin
     # Create a small dummy problem
     # Topology: 2 edges, 2 free nodes, 1 fixed node
     # Edge 1: Node 1 (free) - Node 2 (free)
@@ -49,8 +49,8 @@ using Mooncake
     
     problem = Theseus.OptimizationProblem(topo, loads, geometry, anchors, params)
     
-    @testset "FDMCache Initialization" begin
-        cache = Theseus.FDMCache(problem)
+    @testset "OptimizationCache Initialization" begin
+        cache = Theseus.OptimizationCache(problem)
         
         @test size(cache.A) == (2, 2)
         @test length(cache.q_to_nz) == ne

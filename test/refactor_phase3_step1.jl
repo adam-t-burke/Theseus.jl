@@ -31,7 +31,7 @@ end
 @testset "Phase 3.1: Adjoint Factor Reuse" begin
     N = 1000
     prob = create_scaling_fdm_problem(N)
-    cache = Theseus.FDMCache(prob)
+    cache = Theseus.OptimizationCache(prob)
     copyto!(cache.q, ones(N))
     
     # 1. Forward Pass (Factorizes matrix)

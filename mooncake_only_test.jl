@@ -42,7 +42,7 @@ function test_mooncake_only()
     )
     
     problem = Theseus.OptimizationProblem(topo, loads, geometry, anchors, params)
-    cache = Theseus.FDMCache(problem)
+    cache = Theseus.OptimizationCache(problem)
     
     # Define a simple objective
     function objective(q_scaled, anchors)

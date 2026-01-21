@@ -107,7 +107,7 @@ struct TracingOptions
     emit_frequency::Int
 end
 
-struct OptimizationParameters
+Base.@kwdef struct OptimizationParameters
     objectives::Vector{AbstractObjective}
     bounds::Bounds
     solver::SolverOptions
@@ -149,7 +149,7 @@ struct OptimizationProblem
     parameters::OptimizationParameters
 end
 
-mutable struct FDMCache
+mutable struct OptimizationCache
     # CPU Solver
     A::SparseMatrixCSC{Float64, Int64}
     factor::LDLFactorizations.LDLFactorization{Float64, Int64}
@@ -170,6 +170,11 @@ mutable struct FDMCache
     grad_q::Vector{Float64}
     grad_Nf::Matrix{Float64} # Gradient w.r.t. fixed node positions
     
+    # Primal result buffers
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+    reactions::Matrix{Float64}
+
     # Intermediate buffers for RHS
     Cf_Nf::Matrix{Float64}
     Q_Cf_Nf::Matrix{Float64}
@@ -177,15 +182,7 @@ mutable struct FDMCache
     Nf::Matrix{Float64} # Buffer for current full node positions
     Nf_fixed::Matrix{Float64} # Dense buffer for fixed nodes only
 
-    # Mooncake Shadow Buffers (fdata)
-    x_fdata::Matrix{Float64}
-    λ_fdata::Matrix{Float64}
-    grad_x_fdata::Matrix{Float64}
-    q_fdata::Vector{Float64}
-    grad_q_fdata::Vector{Float64}
-    grad_Nf_fdata::Matrix{Float64}
-
-    function FDMCache(problem::OptimizationProblem)
+    function OptimizationCache(problem::OptimizationProblem)
         topo = problem.topology
         Cn = convert(SparseMatrixCSC{Float64, Int64}, topo.free_incidence)
         Cf = convert(SparseMatrixCSC{Float64, Int64}, topo.fixed_incidence)
@@ -208,14 +205,6 @@ mutable struct FDMCache
 
         # Pre-process incidence to get nodes of each edge
         incidence = problem.topology.incidence
-        for k in 1:ne
-            # find -1 and 1 in row k
-            # Since incidence is CSC, we might need to transpose or search
-            # But the user's topology probably has it stored somehow.
-            # Let's just find the indices.
-        end
-        # Finding in CSC (ne x nn): Search all cols for row k
-        # Faster: Convert to CSR or just use the topology data
         for col in 1:topo.num_nodes
             for idx in incidence.colptr[col]:(incidence.colptr[col+1]-1)
                 row = incidence.rowval[idx]
@@ -269,24 +258,21 @@ mutable struct FDMCache
         grad_q = zeros(ne)
         grad_Nf = zeros(topo.num_nodes, 3)
         
+        member_lengths = zeros(ne)
+        member_forces = zeros(ne)
+        reactions = zeros(topo.num_nodes, 3)
+
         Cf_Nf = zeros(ne, 3)
         Q_Cf_Nf = zeros(ne, 3)
         Pn = copy(problem.loads.free_node_loads)
         Nf = zeros(topo.num_nodes, 3)
         Nf_fixed = zeros(length(topo.fixed_node_indices), 3)
 
-        x_fdata = zeros(nn_free, 3)
-        λ_fdata = zeros(nn_free, 3)
-        grad_x_fdata = zeros(nn_free, 3)
-        q_fdata = zeros(ne)
-        grad_q_fdata = zeros(ne)
-        grad_Nf_fdata = zeros(topo.num_nodes, 3)
-
         new(A, factor, q_to_nz, edge_starts, edge_ends, node_to_free_idx,
             Cn, Cf,
             x, λ, grad_x, q, grad_q, grad_Nf,
-            Cf_Nf, Q_Cf_Nf, Pn, Nf, Nf_fixed,
-            x_fdata, λ_fdata, grad_x_fdata, q_fdata, grad_q_fdata, grad_Nf_fdata)
+            member_lengths, member_forces, reactions,
+            Cf_Nf, Q_Cf_Nf, Pn, Nf, Nf_fixed)
     end
 end
 
@@ -307,7 +293,7 @@ mutable struct OptimizationState
     penalty_trace::Vector{Float64}
     node_trace::Vector{Matrix{Float64}}
     iterations::Int
-    cache::Union{Nothing, FDMCache}
+    cache::Union{Nothing, OptimizationCache}
 end
 
 OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = 
@@ -631,7 +617,7 @@ function build_problem(problem::JSON3.Object)
 
     problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
     state = OptimizationState(q_init, anchors.initial_variable_positions)
-    state.cache = FDMCache(problem_struct)
+    state.cache = OptimizationCache(problem_struct)
 
     problem_struct, state
 end

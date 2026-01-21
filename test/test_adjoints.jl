@@ -59,7 +59,7 @@ function test_adjoints_precision()
     )
     
     problem = Theseus.OptimizationProblem(topo, loads, geometry, anchors, params)
-    cache = Theseus.FDMCache(problem)
+    cache = Theseus.OptimizationCache(problem)
     
     q_init = [1.5, 2.5]
     anchor_pos = zeros(0, 3)
@@ -110,7 +110,7 @@ function test_adjoints_precision()
         initial_variable_positions = reshape([2.0, 1.0, 0.5], 1, 3)
     )
     problem_var = Theseus.OptimizationProblem(topo, loads, geometry, anchors_var, params)
-    cache_var = Theseus.FDMCache(problem_var)
+    cache_var = Theseus.OptimizationCache(problem_var)
     
     a0 = reshape([2.0, 1.0, 0.5], 1, 3)
     

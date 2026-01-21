@@ -39,7 +39,7 @@ end
 
 @testset "Phase 3.2: Gradient Correctness" begin
     prob = create_tiny_problem()
-    cache = Theseus.FDMCache(prob)
+    cache = Theseus.OptimizationCache(prob)
     q0 = [1.5, 2.5]
     copyto!(cache.q, q0)
     

@@ -13,24 +13,59 @@ struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
     reactions::TR
 end
 
-function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::Union{Nothing, FDMCache}=nothing)
+function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::Union{Nothing, OptimizationCache}=nothing)
     if isnothing(cache)
         fixed_positions = current_fixed_positions(problem, anchor_positions)
         xyz_free = solve_FDM(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
         xyz_full = vcat(xyz_free, fixed_positions)
         xyz_fixed = fixed_positions
+        member_vectors = problem.topology.incidence * xyz_full
+        member_lengths = map(norm, eachrow(member_vectors))
+        member_forces = q .* member_lengths
+        reactions = anchor_reactions(problem.topology, q, xyz_full)
+        return GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, member_lengths, member_forces, reactions)
     else
-        xyz_free = solve_FDM!(cache, q, problem, anchor_positions)
-        xyz_full = cache.Nf # Already updated inside solve_FDM!
-        # fixed_positions (the subset) is in xyz_full[topo.fixed_node_indices, :]
-        xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
-    end
+        # In-place update of cache buffers
+        solve_FDM!(cache, q, problem, anchor_positions)
+        xyz_full = cache.Nf
+        ne = length(cache.member_lengths)
+        for i in 1:ne
+            s = cache.edge_starts[i]
+            e = cache.edge_ends[i]
+            
+            dx = xyz_full[e, 1] - xyz_full[s, 1]
+            dy = xyz_full[e, 2] - xyz_full[s, 2]
+            dz = xyz_full[e, 3] - xyz_full[s, 3]
+            
+            len = sqrt(dx^2 + dy^2 + dz^2)
+            cache.member_lengths[i] = len
+            cache.member_forces[i] = q[i] * len
+        end
 
-    member_vectors = problem.topology.incidence * xyz_full
-    member_lengths = map(norm, eachrow(member_vectors))
-    member_forces = q .* member_lengths
-    reactions = anchor_reactions(problem.topology, q, xyz_full)
-    GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, member_lengths, member_forces, reactions)
+        fill!(cache.reactions, 0.0)
+        for i in 1:ne
+            s = cache.edge_starts[i]
+            e = cache.edge_ends[i]
+            qi = q[i]
+            
+            rx = (xyz_full[e, 1] - xyz_full[s, 1]) * qi
+            ry = (xyz_full[e, 2] - xyz_full[s, 2]) * qi
+            rz = (xyz_full[e, 3] - xyz_full[s, 3]) * qi
+            
+            cache.reactions[s, 1] += rx
+            cache.reactions[s, 2] += ry
+            cache.reactions[s, 3] += rz
+            
+            cache.reactions[e, 1] -= rx
+            cache.reactions[e, 2] -= ry
+            cache.reactions[e, 3] -= rz
+        end
+
+        xyz_free = @view xyz_full[problem.topology.free_node_indices, :]
+        xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
+        
+        return GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, cache.member_lengths, cache.member_forces, cache.reactions)
+    end
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -55,7 +90,11 @@ end
 
 function objective_loss(obj::SumForceLengthObjective, snapshot::GeometrySnapshot)
     edges = obj.edge_indices
-    obj.weight * sum(snapshot.member_lengths[edges] .* snapshot.member_forces[edges])
+    loss = zero(eltype(snapshot.member_lengths))
+    for idx in edges
+        loss += snapshot.member_lengths[idx] * snapshot.member_forces[idx]
+    end
+    obj.weight * loss
 end
 
 function objective_loss(obj::MinLengthObjective, snapshot::GeometrySnapshot)

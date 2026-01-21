@@ -26,7 +26,7 @@ High-performance in-place forward solver.
 Updates cache.x based on current q and variable_anchor_positions.
 Uses LDLFactorization and applies conditional perturbations if singular.
 """
-function solve_FDM!(cache::FDMCache, q::AbstractVector{<:Real}, problem::OptimizationProblem, variable_anchor_positions::Matrix{Float64}, perturbation::Float64=1e-12)
+function solve_FDM!(cache::OptimizationCache, q::AbstractVector{<:Real}, problem::OptimizationProblem, variable_anchor_positions::Matrix{Float64}, perturbation::Float64=1e-12)
     # 0. Sync q to cache
     copyto!(cache.q, q)
 

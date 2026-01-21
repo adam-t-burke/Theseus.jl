@@ -31,7 +31,7 @@ end
 
 function compare(N)
     prob = create_benchmark_problem(N)
-    cache = Theseus.FDMCache(prob)
+    cache = Theseus.OptimizationCache(prob)
     copyto!(cache.q, ones(N))
     var_anchors = zeros(0, 3)
 

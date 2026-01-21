@@ -28,7 +28,7 @@ end
 
 function debug_allocs(N)
     p = create_random_fdm_problem(N, Int(N/2), Int(N/2)+1)
-    cache = Theseus.FDMCache(p)
+    cache = Theseus.OptimizationCache(p)
     copyto!(cache.q, ones(N))
     var_anchors = zeros(0,3)
     

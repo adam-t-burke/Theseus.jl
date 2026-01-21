@@ -55,7 +55,7 @@ using BenchmarkTools
     )
     
     problem = Theseus.OptimizationProblem(topo, loads, geometry, anchors, params)
-    cache = Theseus.FDMCache(problem)
+    cache = Theseus.OptimizationCache(problem)
     
     # Set force densities
     q = [2.0, 1.0]

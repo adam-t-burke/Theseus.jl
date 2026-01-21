@@ -40,7 +40,7 @@ end
 
 function compare_performance(N)
     prob = create_benchmark_problem(N)
-    cache = Theseus.FDMCache(prob)
+    cache = Theseus.OptimizationCache(prob)
     q = ones(N)
     copyto!(cache.q, q)
     var_anchors = zeros(0, 3)
