@@ -5,7 +5,7 @@
 ```
 Explicit solver function
 ```
-function solve_explicit(
+function solve_FDM(
     q::AbstractVector{<:Real}, #Vector of force densities
     Cn::SparseMatrixCSC{Int64,Int64}, #Index matrix of free nodes
     Cf::SparseMatrixCSC{Int64,Int64}, #Index matrix of fixed nodes
@@ -26,7 +26,7 @@ High-performance in-place forward solver.
 Updates cache.x based on current q and variable_anchor_positions.
 Uses LDLFactorization and applies conditional perturbations if singular.
 """
-function solve_explicit!(cache::FDMCache, q::AbstractVector{<:Real}, problem::OptimizationProblem, variable_anchor_positions::Matrix{Float64}; perturbation=1e-12)
+function solve_FDM!(cache::FDMCache, q::AbstractVector{<:Real}, problem::OptimizationProblem, variable_anchor_positions::Matrix{Float64}, perturbation::Float64=1e-12)
     # 0. Sync q to cache
     copyto!(cache.q, q)
 
@@ -90,6 +90,6 @@ function solve_explicit!(cache::FDMCache, q::AbstractVector{<:Real}, problem::Op
         end
     end
     
-    error("solve_explicit! failed after $max_retries retries.")
+    error("solve_FDM! failed after $max_retries retries.")
 end
 

@@ -1,6 +1,6 @@
 using LinearAlgebra
 using Optim
-using Zygote
+using Mooncake
 using ChainRulesCore: ignore_derivatives
 using Logging
 
@@ -16,12 +16,12 @@ end
 function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::Union{Nothing, FDMCache}=nothing)
     if isnothing(cache)
         fixed_positions = current_fixed_positions(problem, anchor_positions)
-        xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
+        xyz_free = solve_FDM(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
         xyz_full = vcat(xyz_free, fixed_positions)
         xyz_fixed = fixed_positions
     else
-        xyz_free = solve_explicit!(cache, q, problem, anchor_positions)
-        xyz_full = cache.Nf # Already updated inside solve_explicit!
+        xyz_free = solve_FDM!(cache, q, problem, anchor_positions)
+        xyz_full = cache.Nf # Already updated inside solve_FDM!
         # fixed_positions (the subset) is in xyz_full[topo.fixed_node_indices, :]
         xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
     end
@@ -159,8 +159,19 @@ function parameter_bounds(problem::OptimizationProblem)
 end
 
 function make_gradient(objective)
+    # Pre-build the gradient cache once
+    # θ0 is not known here, but we can initialize it with any value of the same type/shape if needed
+    # Better yet, we can do it inside g! or pass it in.
+    # For now, let's initialize it on the first call or just prepare it here if we had a prototype.
+    
+    # Actually, Mooncake's value_and_gradient!! can be fast if the cache is reused.
+    gradient_cache = Ref{Any}(nothing)
+
     function g!(G, θ)
-        grad = gradient(objective, θ)[1]
+        if gradient_cache[] === nothing
+            gradient_cache[] = Mooncake.prepare_gradient_cache(objective, θ)
+        end
+        _, grad = Mooncake.value_and_gradient!!(gradient_cache[], objective, θ)
         copyto!(G, grad)
     end
     g!

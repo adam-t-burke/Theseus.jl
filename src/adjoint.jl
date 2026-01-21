@@ -5,9 +5,10 @@ using LinearAlgebra
 using SparseArrays
 using LinearSolve
 using Mooncake
-using Mooncake: NoTangent
-using ChainRulesCore
-using ChainRulesCore: NoTangent as ZNoTangent
+using Mooncake: NoTangent, @is_primitive, ReverseMode, DefaultCtx, CoDual, NoRData, NoFData
+
+# Register solve_FDM! as a primitive for Mooncake
+@is_primitive DefaultCtx ReverseMode Tuple{typeof(Theseus.solve_FDM!), Vararg{Any}}
 
 """
     solve_adjoint!(cache::Theseus.FDMCache, dJ_dx::AbstractMatrix)
@@ -18,7 +19,7 @@ Since A is symmetric (C'QC), we reuse the same factorization.
 function solve_adjoint!(cache::Theseus.FDMCache, dJ_dx::AbstractMatrix)
     # Solve A * lambda = dJ_dx
     # We DO NOT update cache.factor here because we want to reuse the 
-    # factors already calculated in solve_explicit!. 
+    # factors already calculated in solve_FDM!. 
     ldiv!(cache.λ, cache.factor, dJ_dx)
     return nothing
 end
@@ -46,7 +47,7 @@ function accumulate_gradients!(cache::Theseus.FDMCache, p::Theseus.OptimizationP
             λ_v = v_free > 0 ? cache.λ[v_free, d] : 0.0
             dλ = λ_v - λ_u
             
-            # Nf contains ALL node positions (updated in solve_explicit!)
+            # Nf contains ALL node positions (updated in solve_FDM!)
             dN = cache.Nf[v, d] - cache.Nf[u, d]
             
             # ∂J/∂q_k
@@ -69,69 +70,75 @@ function accumulate_gradients!(cache::Theseus.FDMCache, p::Theseus.OptimizationP
     return nothing
 end
 
-# Mooncake Rule for solve_explicit!
+# Mooncake Rule for solve_FDM!
+# We provide 4 and 5 argument versions to match solve_FDM! signatures.
+
 function Mooncake.rrule!!(
-    ::Any,
-    ::typeof(Theseus.solve_explicit!),
-    cache::Theseus.FDMCache,
-    q::AbstractVector{<:Real},
-    problem::Theseus.OptimizationProblem,
-    variable_anchor_positions::Matrix{Float64}
+    f_cd::CoDual{typeof(Theseus.solve_FDM!)},
+    cache_cd::CoDual{<:Theseus.FDMCache},
+    q_cd::CoDual{<:AbstractVector{<:Real}},
+    problem_cd::CoDual{<:Theseus.OptimizationProblem},
+    anchors_cd::CoDual{<:Matrix{Float64}}
 )
-    # Primal
-    x = Theseus.solve_explicit!(cache, q, problem, variable_anchor_positions)
+    cache = cache_cd.x
+    snapshot = Theseus.solve_FDM!(cache, q_cd.x, problem_cd.x, anchors_cd.x)
+    
+    # We return the CoDual pointing to the result in cache.x and its corresponding shadow in cache_cd.dx.fields.x
+    out_cd = CoDual(snapshot, cache_cd.dx.fields.x)
 
-    # Pullback
-    function solve_explicit_pullback(dx)
-        # 1. Backsolve to get lambda
-        solve_adjoint!(cache, dx)
+    function solve_FDM_pullback(dy::NoRData)
+        # dJ/dx is stored in cache_cd.dx.fields.x
+        solve_adjoint!(cache, cache_cd.dx.fields.x)
+        accumulate_gradients!(cache, problem_cd.x)
         
-        # 2. Accumulate gradients for q and Nf
-        accumulate_gradients!(cache, problem)
+        # Accumulate into argument shadows
+        q_cd.dx .+= cache.grad_q
         
-        # 3. Return tangents
-        return (NoTangent(), NoTangent(), NoTangent(), NoTangent(), NoTangent())
-    end
-
-    return x, solve_explicit_pullback
-end
-
-# Zygote/ChainRules Rule for solve_explicit!
-function ChainRulesCore.rrule(
-    ::typeof(Theseus.solve_explicit!),
-    cache::Theseus.FDMCache,
-    q::AbstractVector{<:Real},
-    problem::Theseus.OptimizationProblem,
-    variable_anchor_positions::Matrix{Float64}
-)
-    # Primal
-    x = Theseus.solve_explicit!(cache, q, problem, variable_anchor_positions)
-
-    # Pullback
-    function solve_explicit_pullback(dx)
-        # 1. Backsolve to get lambda
-        solve_adjoint!(cache, unthunk(dx))
-        
-        # 2. Accumulate gradients for q and Nf
-        accumulate_gradients!(cache, problem)
-        
-        # 3. Extract tangents for Zygote
-        grad_q = copy(cache.grad_q)
-        
-        # Extract gradients for variable anchors
-        grad_anchors = zeros(eltype(x), size(variable_anchor_positions))
-        var_indices = problem.anchors.variable_indices
+        var_indices = problem_cd.x.anchors.variable_indices
         for i in 1:length(var_indices)
             idx = var_indices[i]
-            grad_anchors[i, 1] = cache.grad_Nf[idx, 1]
-            grad_anchors[i, 2] = cache.grad_Nf[idx, 2]
-            grad_anchors[i, 3] = cache.grad_Nf[idx, 3]
+            anchors_cd.dx[i, 1] += cache.grad_Nf[idx, 1]
+            anchors_cd.dx[i, 2] += cache.grad_Nf[idx, 2]
+            anchors_cd.dx[i, 3] += cache.grad_Nf[idx, 3]
         end
         
-        return (ZNoTangent(), ZNoTangent(), grad_q, ZNoTangent(), grad_anchors)
+        return NoRData(), NoRData(), NoRData(), Mooncake.rdata(Mooncake.zero_tangent(problem_cd.x)), NoRData()
     end
 
-    return x, solve_explicit_pullback
+    return out_cd, solve_FDM_pullback
+end
+
+function Mooncake.rrule!!(
+    f_cd::CoDual{typeof(Theseus.solve_FDM!)},
+    cache_cd::CoDual{<:Theseus.FDMCache},
+    q_cd::CoDual{<:AbstractVector{<:Real}},
+    problem_cd::CoDual{<:Theseus.OptimizationProblem},
+    anchors_cd::CoDual{<:Matrix{Float64}},
+    perturbation_cd::CoDual{Float64}
+)
+    cache = cache_cd.x
+    snapshot = Theseus.solve_FDM!(cache, q_cd.x, problem_cd.x, anchors_cd.x, perturbation_cd.x)
+    
+    out_cd = CoDual(snapshot, cache_cd.dx.fields.x)
+
+    function solve_FDM_pullback_ext(dy::NoRData)
+        solve_adjoint!(cache, cache_cd.dx.fields.x)
+        accumulate_gradients!(cache, problem_cd.x)
+        
+        q_cd.dx .+= cache.grad_q
+        
+        var_indices = problem_cd.x.anchors.variable_indices
+        for i in 1:length(var_indices)
+            idx = var_indices[i]
+            anchors_cd.dx[i, 1] += cache.grad_Nf[idx, 1]
+            anchors_cd.dx[i, 2] += cache.grad_Nf[idx, 2]
+            anchors_cd.dx[i, 3] += cache.grad_Nf[idx, 3]
+        end
+        
+        return NoRData(), NoRData(), NoRData(), Mooncake.rdata(Mooncake.zero_tangent(problem_cd.x)), NoRData(), 0.0
+    end
+
+    return out_cd, solve_FDM_pullback_ext
 end
 
 end # module
