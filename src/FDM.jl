@@ -23,11 +23,15 @@ end
 
 """
 High-performance in-place forward solver.
-Updates cache.x based on current cache.q and variable_anchor_positions.
+Updates cache.x based on current q and variable_anchor_positions.
 Uses LDLFactorization and applies conditional perturbations if singular.
 """
-function solve_explicit!(cache::FDMCache, problem::OptimizationProblem, variable_anchor_positions::Matrix{Float64}; perturbation=1e-12)
+function solve_explicit!(cache::FDMCache, q::AbstractVector{<:Real}, problem::OptimizationProblem, variable_anchor_positions::Matrix{Float64}; perturbation=1e-12)
+    # 0. Sync q to cache
+    copyto!(cache.q, q)
+
     # 1. Update A.nzval in-place
+    # println("Debug: updating nzval")
     fill!(cache.A.nzval, 0.0)
     for k in 1:length(cache.q)
         qk = cache.q[k]
@@ -40,8 +44,13 @@ function solve_explicit!(cache::FDMCache, problem::OptimizationProblem, variable
     current_fixed_positions!(cache.Nf, problem, variable_anchor_positions)
     
     fixed_indices = problem.topology.fixed_node_indices
-    Nf_fixed = @view cache.Nf[fixed_indices, :]
-    mul!(cache.Cf_Nf, cache.Cf, Nf_fixed)
+    # Copy to dense buffer to avoid slow sparse * view multiplication
+    for j in 1:3
+        for i in 1:length(fixed_indices)
+            cache.Nf_fixed[i, j] = cache.Nf[fixed_indices[i], j]
+        end
+    end
+    mul!(cache.Cf_Nf, cache.Cf, cache.Nf_fixed)
     
     for j in 1:3
         for i in 1:length(cache.q)
@@ -49,20 +58,17 @@ function solve_explicit!(cache::FDMCache, problem::OptimizationProblem, variable
         end
     end
     
-    rhs = cache.integrator.b
-    copyto!(rhs, cache.Pn)
-    mul!(rhs, cache.Cn', cache.Q_Cf_Nf, -1.0, 1.0)
+    copyto!(cache.grad_x, cache.Pn) 
+    mul!(cache.grad_x, cache.Cn', cache.Q_Cf_Nf, -1.0, 1.0)
 
     # 3. Solve A * x = RHS
-    # Explicitly signal that A has changed to force re-factorization
-    cache.integrator.A = cache.A
-
+    # println("Debug: solving")
     max_retries = 1
     for retry in 0:max_retries
-        sol = LinearSolve.solve!(cache.integrator)
-        
-        if sol.retcode == LinearSolve.ReturnCode.Success
-            copyto!(cache.x, sol.u)
+        try
+            LDLFactorizations.ldl_factorize!(cache.A, cache.factor)
+            ldiv!(cache.x, cache.factor, cache.grad_x)
+            
             # Update Nf buffer with free node positions for subsequent gradient calls
             free_indices = problem.topology.free_node_indices
             for j in 1:3
@@ -71,16 +77,16 @@ function solve_explicit!(cache::FDMCache, problem::OptimizationProblem, variable
                 end
             end
             return cache.x
-        end
-        
-        if retry < max_retries
-            @warn "Linear solve failed with retcode $(sol.retcode). Applying perturbation of $perturbation to diagonal."
-            for i in 1:size(cache.A, 1)
-                nz_idx = find_nz_index(cache.A, i, i)
-                cache.A.nzval[nz_idx] += perturbation
+        catch e
+            if retry < max_retries
+                @warn "Linear solve failed. Applying perturbation of $perturbation to diagonal."
+                for i in 1:size(cache.A, 1)
+                    nz_idx = find_nz_index(cache.A, i, i)
+                    cache.A.nzval[nz_idx] += perturbation
+                end
+            else
+                rethrow(e)
             end
-            # Signal change again
-            cache.integrator.A = cache.A
         end
     end
     

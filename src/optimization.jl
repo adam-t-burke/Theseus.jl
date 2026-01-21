@@ -13,15 +13,24 @@ struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
     reactions::TR
 end
 
-function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real})
-    fixed_positions = current_fixed_positions(problem, anchor_positions)
-    xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
-    xyz_full = vcat(xyz_free, fixed_positions)
+function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::Union{Nothing, FDMCache}=nothing)
+    if isnothing(cache)
+        fixed_positions = current_fixed_positions(problem, anchor_positions)
+        xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
+        xyz_full = vcat(xyz_free, fixed_positions)
+        xyz_fixed = fixed_positions
+    else
+        xyz_free = solve_explicit!(cache, q, problem, anchor_positions)
+        xyz_full = cache.Nf # Already updated inside solve_explicit!
+        # fixed_positions (the subset) is in xyz_full[topo.fixed_node_indices, :]
+        xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
+    end
+
     member_vectors = problem.topology.incidence * xyz_full
     member_lengths = map(norm, eachrow(member_vectors))
     member_forces = q .* member_lengths
     reactions = anchor_reactions(problem.topology, q, xyz_full)
-    GeometrySnapshot(xyz_free, fixed_positions, xyz_full, member_lengths, member_forces, reactions)
+    GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, member_lengths, member_forces, reactions)
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -113,7 +122,7 @@ function form_finding_objective(problem::OptimizationProblem, trace_state::Optim
 
     function objective(θ)
         q, anchors = unpack_parameters(problem, θ)
-        snapshot = evaluate_geometry(problem, q, anchors)
+        snapshot = evaluate_geometry(problem, q, anchors, trace_state.cache)
         
         geometric_loss = total_loss(problem, q, anchors, snapshot)
         barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)

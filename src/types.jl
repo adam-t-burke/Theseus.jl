@@ -152,7 +152,7 @@ end
 mutable struct FDMCache
     # CPU Solver
     A::SparseMatrixCSC{Float64, Int64}
-    integrator::Any
+    factor::LDLFactorizations.LDLFactorization{Float64, Int64}
     q_to_nz::Vector{Vector{Tuple{Int, Float64}}} # maps edge index -> indices and coeffs in A.nzval
     edge_starts::Vector{Int} # node index (1..nn)
     edge_ends::Vector{Int}   # node index (1..nn)
@@ -174,7 +174,8 @@ mutable struct FDMCache
     Cf_Nf::Matrix{Float64}
     Q_Cf_Nf::Matrix{Float64}
     Pn::Matrix{Float64}
-    Nf::Matrix{Float64} # Buffer for current fixed node positions
+    Nf::Matrix{Float64} # Buffer for current full node positions
+    Nf_fixed::Matrix{Float64} # Dense buffer for fixed nodes only
 
     # Mooncake Shadow Buffers (fdata)
     x_fdata::Matrix{Float64}
@@ -255,12 +256,10 @@ mutable struct FDMCache
             end
         end
 
-        # 2. Initialize LinearSolve integrator
-        rhs = zeros(nn_free, 3)
-        u0 = zeros(nn_free, 3)
-        prob = LinearSolve.LinearProblem(A, rhs; u0 = u0)
-        # Using UMFPACK for robustness with SparseMatrixCSC
-        integrator = LinearSolve.init(prob, LinearSolve.UMFPACKFactorization())
+        # 2. Initialize LDLFactorization
+        # Fill diagonal to ensure initial symbolic/numeric pass works
+        for i in 1:nn_free; A.nzval[find_nz_index(A, i, i)] = 1.0; end
+        factor = LDLFactorizations.ldl(A)
 
         # 3. Pre-allocate buffers
         x = zeros(nn_free, 3)
@@ -274,6 +273,7 @@ mutable struct FDMCache
         Q_Cf_Nf = zeros(ne, 3)
         Pn = copy(problem.loads.free_node_loads)
         Nf = zeros(topo.num_nodes, 3)
+        Nf_fixed = zeros(length(topo.fixed_node_indices), 3)
 
         x_fdata = zeros(nn_free, 3)
         λ_fdata = zeros(nn_free, 3)
@@ -282,10 +282,10 @@ mutable struct FDMCache
         grad_q_fdata = zeros(ne)
         grad_Nf_fdata = zeros(topo.num_nodes, 3)
 
-        new(A, integrator, q_to_nz, edge_starts, edge_ends, node_to_free_idx,
+        new(A, factor, q_to_nz, edge_starts, edge_ends, node_to_free_idx,
             Cn, Cf,
             x, λ, grad_x, q, grad_q, grad_Nf,
-            Cf_Nf, Q_Cf_Nf, Pn, Nf,
+            Cf_Nf, Q_Cf_Nf, Pn, Nf, Nf_fixed,
             x_fdata, λ_fdata, grad_x_fdata, q_fdata, grad_q_fdata, grad_Nf_fdata)
     end
 end
@@ -307,9 +307,11 @@ mutable struct OptimizationState
     penalty_trace::Vector{Float64}
     node_trace::Vector{Matrix{Float64}}
     iterations::Int
+    cache::Union{Nothing, FDMCache}
 end
 
-OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Float64[], Matrix{Float64}[], 0)
+OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = 
+    OptimizationState(force_densities, variable_anchor_positions, Float64[], Float64[], Matrix{Float64}[], 0, nothing)
 
 struct ObjectiveContext
     num_edges::Int
@@ -336,6 +338,11 @@ function current_fixed_positions!(dest::AbstractMatrix{T}, problem::Optimization
         end
     end
     return dest
+end
+
+function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
+    dest = zeros(eltype(anchor_positions), size(problem.anchors.reference_positions))
+    current_fixed_positions!(dest, problem, anchor_positions)
 end
 
 current_fixed_positions(problem::OptimizationProblem, state::OptimizationState) =
@@ -624,6 +631,7 @@ function build_problem(problem::JSON3.Object)
 
     problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
     state = OptimizationState(q_init, anchors.initial_variable_positions)
+    state.cache = FDMCache(problem_struct)
 
     problem_struct, state
 end

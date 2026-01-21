@@ -6,24 +6,20 @@ using SparseArrays
 using LinearSolve
 using Mooncake
 using Mooncake: NoTangent
+using ChainRulesCore
+using ChainRulesCore: NoTangent as ZNoTangent
 
 """
     solve_adjoint!(cache::Theseus.FDMCache, dJ_dx::AbstractMatrix)
 
 Solves the adjoint system A^T λ = dJ_dx using the pre-factorized matrix from the forward pass.
-Since A is symmetric (C'QC), we reuse the same integrator and factorization.
+Since A is symmetric (C'QC), we reuse the same factorization.
 """
 function solve_adjoint!(cache::Theseus.FDMCache, dJ_dx::AbstractMatrix)
-    # Seed the RHS of the linear solver with the objective gradient
-    copyto!(cache.integrator.b, dJ_dx)
-    
-    # We DO NOT update integrator.A here because we want to reuse the 
+    # Solve A * lambda = dJ_dx
+    # We DO NOT update cache.factor here because we want to reuse the 
     # factors already calculated in solve_explicit!. 
-    # LinearSolve.solve! will skip factorization if integrator.A hasn't changed.
-    LinearSolve.solve!(cache.integrator)
-    
-    # integrator.u now contains λ. Copy it to our buffer.
-    copyto!(cache.λ, cache.integrator.u)
+    ldiv!(cache.λ, cache.factor, dJ_dx)
     return nothing
 end
 
@@ -78,11 +74,12 @@ function Mooncake.rrule!!(
     ::Any,
     ::typeof(Theseus.solve_explicit!),
     cache::Theseus.FDMCache,
+    q::AbstractVector{<:Real},
     problem::Theseus.OptimizationProblem,
     variable_anchor_positions::Matrix{Float64}
 )
     # Primal
-    x = Theseus.solve_explicit!(cache, problem, variable_anchor_positions)
+    x = Theseus.solve_explicit!(cache, q, problem, variable_anchor_positions)
 
     # Pullback
     function solve_explicit_pullback(dx)
@@ -93,10 +90,45 @@ function Mooncake.rrule!!(
         accumulate_gradients!(cache, problem)
         
         # 3. Return tangents
-        # Since cache and problem are mutable and we've updated their internal 
-        # gradient buffers (grad_q, grad_Nf), we return NoTangent for the 
-        # objects themselves in the Mooncake sense for now.
-        return (NoTangent(), NoTangent(), NoTangent(), NoTangent())
+        return (NoTangent(), NoTangent(), NoTangent(), NoTangent(), NoTangent())
+    end
+
+    return x, solve_explicit_pullback
+end
+
+# Zygote/ChainRules Rule for solve_explicit!
+function ChainRulesCore.rrule(
+    ::typeof(Theseus.solve_explicit!),
+    cache::Theseus.FDMCache,
+    q::AbstractVector{<:Real},
+    problem::Theseus.OptimizationProblem,
+    variable_anchor_positions::Matrix{Float64}
+)
+    # Primal
+    x = Theseus.solve_explicit!(cache, q, problem, variable_anchor_positions)
+
+    # Pullback
+    function solve_explicit_pullback(dx)
+        # 1. Backsolve to get lambda
+        solve_adjoint!(cache, unthunk(dx))
+        
+        # 2. Accumulate gradients for q and Nf
+        accumulate_gradients!(cache, problem)
+        
+        # 3. Extract tangents for Zygote
+        grad_q = copy(cache.grad_q)
+        
+        # Extract gradients for variable anchors
+        grad_anchors = zeros(eltype(x), size(variable_anchor_positions))
+        var_indices = problem.anchors.variable_indices
+        for i in 1:length(var_indices)
+            idx = var_indices[i]
+            grad_anchors[i, 1] = cache.grad_Nf[idx, 1]
+            grad_anchors[i, 2] = cache.grad_Nf[idx, 2]
+            grad_anchors[i, 3] = cache.grad_Nf[idx, 3]
+        end
+        
+        return (ZNoTangent(), ZNoTangent(), grad_q, ZNoTangent(), grad_anchors)
     end
 
     return x, solve_explicit_pullback
