@@ -168,6 +168,7 @@ mutable struct FDMCache
     grad_x::Matrix{Float64}
     q::Vector{Float64}
     grad_q::Vector{Float64}
+    grad_Nf::Matrix{Float64} # Gradient w.r.t. fixed node positions
     
     # Intermediate buffers for RHS
     Cf_Nf::Matrix{Float64}
@@ -181,6 +182,7 @@ mutable struct FDMCache
     grad_x_fdata::Matrix{Float64}
     q_fdata::Vector{Float64}
     grad_q_fdata::Vector{Float64}
+    grad_Nf_fdata::Matrix{Float64}
 
     function FDMCache(problem::OptimizationProblem)
         topo = problem.topology
@@ -266,6 +268,7 @@ mutable struct FDMCache
         grad_x = zeros(nn_free, 3)
         q = zeros(ne)
         grad_q = zeros(ne)
+        grad_Nf = zeros(topo.num_nodes, 3)
         
         Cf_Nf = zeros(ne, 3)
         Q_Cf_Nf = zeros(ne, 3)
@@ -277,12 +280,13 @@ mutable struct FDMCache
         grad_x_fdata = zeros(nn_free, 3)
         q_fdata = zeros(ne)
         grad_q_fdata = zeros(ne)
+        grad_Nf_fdata = zeros(topo.num_nodes, 3)
 
-        new(A, integrator, q_to_nz, edge_starts, edge_ends,
+        new(A, integrator, q_to_nz, edge_starts, edge_ends, node_to_free_idx,
             Cn, Cf,
-            x, λ, grad_x, q, grad_q,
+            x, λ, grad_x, q, grad_q, grad_Nf,
             Cf_Nf, Q_Cf_Nf, Pn, Nf,
-            x_fdata, λ_fdata, grad_x_fdata, q_fdata, grad_q_fdata)
+            x_fdata, λ_fdata, grad_x_fdata, q_fdata, grad_q_fdata, grad_Nf_fdata)
     end
 end
 

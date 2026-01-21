@@ -63,6 +63,13 @@ function solve_explicit!(cache::FDMCache, problem::OptimizationProblem, variable
         
         if sol.retcode == LinearSolve.ReturnCode.Success
             copyto!(cache.x, sol.u)
+            # Update Nf buffer with free node positions for subsequent gradient calls
+            free_indices = problem.topology.free_node_indices
+            for j in 1:3
+                for i in 1:length(free_indices)
+                    cache.Nf[free_indices[i], j] = cache.x[i, j]
+                end
+            end
             return cache.x
         end
         
