@@ -91,7 +91,7 @@ struct Bounds
     upper::Vector{Float64}
 end
 
-struct SolverOptions
+Base.@kwdef struct SolverOptions
     absolute_tolerance::Float64
     relative_tolerance::Float64
     max_iterations::Int
@@ -102,7 +102,7 @@ struct SolverOptions
     use_auto_scaling::Bool
 end
 
-struct TracingOptions
+Base.@kwdef struct TracingOptions
     record_nodes::Bool
     emit_frequency::Int
 end

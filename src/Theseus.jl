@@ -5,6 +5,8 @@ using Statistics
 using SparseArrays
 using Optim
 using Mooncake
+using ADTypes
+using DifferentiationInterface
 using LinearSolve
 using LDLFactorizations
 using SparseDiffTools
