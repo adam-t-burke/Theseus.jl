@@ -35,7 +35,7 @@ function debug_allocs(N)
     println("\n--- Debugging Allocs for N=$N ---")
     
     # Warmup
-    Theseus.solve_explicit!(cache, p, var_anchors)
+    Theseus.solve_FDM!(cache, p, var_anchors)
 
     # 1. Nzval update
     a1 = @allocated begin

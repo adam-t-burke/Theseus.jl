@@ -59,7 +59,7 @@ state.cache = Theseus.OptimizationCache(problem)
 # Define a simple objective function
 function my_objective_logic(θ)
     q = θ[1:2]
-    # In evaluate_geometry, it will use solve_explicit! which has our Mooncake rule
+    # In evaluate_geometry, it will use solve_FDM! which has our Mooncake rule
     snap = Theseus.evaluate_geometry(problem, q, state.variable_anchor_positions, state.cache)
     return sum(snap.xyz_free.^2) # Minimize distance from origin
 end

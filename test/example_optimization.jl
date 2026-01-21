@@ -100,7 +100,8 @@ function run_example()
 end
 
 function full_objective_eval(problem, q)
-    snapshot = Theseus.evaluate_geometry(problem, q, zeros(0,3))
+    cache = Theseus.OptimizationCache(problem)
+    snapshot = Theseus.evaluate_geometry(problem, q, zeros(0,3), cache)
     loss = 0.0
     for obj in problem.parameters.objectives
         loss += Theseus.objective_loss(obj, snapshot)

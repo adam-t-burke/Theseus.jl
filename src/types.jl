@@ -1,6 +1,7 @@
 using JSON3
 using SparseArrays
 using LinearAlgebra
+using TimerOutputs
 
 const DEFAULT_BARRIER_SHARPNESS = 10.0
 
@@ -149,6 +150,15 @@ struct OptimizationProblem
     parameters::OptimizationParameters
 end
 
+struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
+    xyz_free::TF
+    xyz_fixed::TX
+    xyz_full::TA
+    member_lengths::VL
+    member_forces::VF
+    reactions::TR
+end
+
 mutable struct OptimizationCache
     # CPU Solver
     A::SparseMatrixCSC{Float64, Int64}
@@ -181,6 +191,10 @@ mutable struct OptimizationCache
     Pn::Matrix{Float64}
     Nf::Matrix{Float64} # Buffer for current full node positions
     Nf_fixed::Matrix{Float64} # Dense buffer for fixed nodes only
+
+    # Profiling and state
+    to::TimerOutput
+    last_snapshot::Union{Nothing, GeometrySnapshot}
 
     function OptimizationCache(problem::OptimizationProblem)
         topo = problem.topology
@@ -268,11 +282,15 @@ mutable struct OptimizationCache
         Nf = zeros(topo.num_nodes, 3)
         Nf_fixed = zeros(length(topo.fixed_node_indices), 3)
 
+        to = TimerOutput()
+        last_snapshot = nothing
+
         new(A, factor, q_to_nz, edge_starts, edge_ends, node_to_free_idx,
             Cn, Cf,
             x, λ, grad_x, q, grad_q, grad_Nf,
             member_lengths, member_forces, reactions,
-            Cf_Nf, Q_Cf_Nf, Pn, Nf, Nf_fixed)
+            Cf_Nf, Q_Cf_Nf, Pn, Nf, Nf_fixed,
+            to, last_snapshot)
     end
 end
 
@@ -311,9 +329,26 @@ default_bounds(ne::Int) = Bounds(fill(1e-8, ne), fill(Inf, ne))
 function current_fixed_positions!(dest::AbstractMatrix{T}, problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real}) where T
     anchor = problem.anchors
     ref = anchor.reference_positions
+    fixed_indices = problem.topology.fixed_node_indices
     
-    # 1. Start with reference positions
-    copyto!(dest, ref)
+    # 1. Overlay reference positions of fixed nodes
+    # We assume 'ref' contains positions for the nodes listed in 'fixed_indices'
+    if size(ref, 1) == length(fixed_indices)
+        for dim in 1:3
+            for (i, node_idx) in enumerate(fixed_indices)
+                dest[node_idx, dim] = ref[i, dim]
+            end
+        end
+    elseif size(ref, 1) == problem.topology.num_nodes
+        # Fallback if 'ref' is a full matrix of all nodes
+        for dim in 1:3
+            for node_idx in fixed_indices
+                dest[node_idx, dim] = ref[node_idx, dim]
+            end
+        end
+    else
+        error("Dimension mismatch: reference_positions has $(size(ref, 1)) nodes but expected either $(length(fixed_indices)) (fixed only) or $(problem.topology.num_nodes) (all).")
+    end
     
     # 2. Overlay variable anchors
     if !isempty(anchor.variable_indices)
@@ -327,7 +362,7 @@ function current_fixed_positions!(dest::AbstractMatrix{T}, problem::Optimization
 end
 
 function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
-    dest = zeros(eltype(anchor_positions), size(problem.anchors.reference_positions))
+    dest = zeros(eltype(anchor_positions), problem.topology.num_nodes, 3)
     current_fixed_positions!(dest, problem, anchor_positions)
 end
 

@@ -39,13 +39,13 @@ function benchmark_size(N)
     
     # 1. Forward Pass Bench
     # Warmup
-    Theseus.solve_explicit!(cache, prob, var_anchors)
-    fwd_time = @belapsed Theseus.solve_explicit!($cache, $prob, $var_anchors)
-    fwd_allocs = @allocated Theseus.solve_explicit!(cache, prob, var_anchors)
+    Theseus.solve_FDM!(cache, prob, var_anchors)
+    fwd_time = @belapsed Theseus.solve_FDM!($cache, $prob, $var_anchors)
+    fwd_allocs = @allocated Theseus.solve_FDM!(cache, prob, var_anchors)
     
     # 2. Mooncake Rule Initialization (Creating the pullback)
     # This might have small constant allocations due to closure creation
-    _, pb = Mooncake.rrule!!(nothing, Theseus.solve_explicit!, cache, prob, var_anchors)
+    _, pb = Mooncake.rrule!!(nothing, Theseus.solve_FDM!, cache, prob, var_anchors)
     
     # 3. Pullback Bench
     dx = randn(size(cache.x))

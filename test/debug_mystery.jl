@@ -49,9 +49,9 @@ function compare(N)
     end
     println("Backslash: $(round(t_backslash*1000, digits=3)) ms")
 
-    # 2. Theseus solve_explicit!
+    # 2. Theseus solve_FDM!
     # Warmup
-    Theseus.solve_explicit!(cache, prob, var_anchors)
+    Theseus.solve_FDM!(cache, prob, var_anchors)
     
     println("Breakdown for Theseus:")
     
@@ -97,7 +97,7 @@ function compare(N)
     println("  LDL solve   : $(round(t_sol*1000, digits=3)) ms")
     
     # Total
-    t_total = @belapsed Theseus.solve_explicit!($cache, $prob, $var_anchors)
+    t_total = @belapsed Theseus.solve_FDM!($cache, $prob, $var_anchors)
     println("Total Theseus : $(round(t_total*1000, digits=3)) ms")
 end
 

@@ -44,7 +44,7 @@ end
     copyto!(cache.q, q0)
     
     # 1. Forward Pass
-    Theseus.solve_explicit!(cache, prob, zeros(0,3))
+    Theseus.solve_FDM!(cache, prob, zeros(0,3))
     x0 = copy(cache.x)
     
     # 2. Objective: J = sum(x.^2)
@@ -63,12 +63,12 @@ end
         q_eps = copy(q0)
         q_eps[i] += eps
         copyto!(cache.q, q_eps)
-        Theseus.solve_explicit!(cache, prob, zeros(0,3))
+        Theseus.solve_FDM!(cache, prob, zeros(0,3))
         J_plus = sum(cache.x .^ 2)
         
         q_eps[i] -= 2*eps
         copyto!(cache.q, q_eps)
-        Theseus.solve_explicit!(cache, prob, zeros(0,3))
+        Theseus.solve_FDM!(cache, prob, zeros(0,3))
         J_minus = sum(cache.x .^ 2)
         
         fd_grad_q[i] = (J_plus - J_minus) / (2*eps)
@@ -91,12 +91,12 @@ end
     
     prob.geometry.fixed_node_positions[nudge_node, nudge_dim] = old_val + eps
     copyto!(cache.q, q0)
-    Theseus.solve_explicit!(cache, prob, zeros(0,3))
+    Theseus.solve_FDM!(cache, prob, zeros(0,3))
     J_plus = sum(cache.x .^ 2)
     
     prob.geometry.fixed_node_positions[nudge_node, nudge_dim] = old_val - eps
     copyto!(cache.q, q0)
-    Theseus.solve_explicit!(cache, prob, zeros(0,3))
+    Theseus.solve_FDM!(cache, prob, zeros(0,3))
     J_minus = sum(cache.x .^ 2)
     
     fd_grad_Nf2x = (J_plus - J_minus) / (2*eps)

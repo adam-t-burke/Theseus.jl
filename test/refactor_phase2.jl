@@ -63,11 +63,11 @@ using BenchmarkTools
     
     # 2. Test Accuracy
     var_anchors = zeros(0, 3) # no variable anchors
-    x_new = Theseus.solve_explicit!(cache, problem, var_anchors)
+    x_new = Theseus.solve_FDM!(cache, problem, var_anchors)
     
     # Reference calculation
     Nf_fixed = @view Nf_full[fixed_nodes, :]
-    x_ref = Theseus.solve_explicit(q, free_incidence, fixed_incidence, Pn, Nf_fixed)
+    x_ref = Theseus.solve_FDM(q, free_incidence, fixed_incidence, Pn, Nf_fixed)
     
     @test x_new ≈ x_ref atol=1e-10
     
@@ -76,10 +76,10 @@ using BenchmarkTools
     # But specifically the RHS assembly and A update should be non-allocating.
     
     # Warm up
-    Theseus.solve_explicit!(cache, problem, var_anchors)
+    Theseus.solve_FDM!(cache, problem, var_anchors)
     
-    allocs = @allocated Theseus.solve_explicit!(cache, problem, var_anchors)
-    @info "Allocations in solve_explicit!: $allocs"
+    allocs = @allocated Theseus.solve_FDM!(cache, problem, var_anchors)
+    @info "Allocations in solve_FDM!: $allocs"
     # Note: On some platforms, LinearSolve/UMFPACK might still allocate for factors.
     # But for a small problem, it should be very low.
     @test allocs < 20000 # Relaxed bound for metadata/UMFPACK overhead
@@ -88,7 +88,7 @@ using BenchmarkTools
     # Set q to 0 to make A singular
     fill!(cache.q, 0.0)
     # This should trigger perturbation and warning
-    @test_logs (:warn, r"Linear solve failed|Linear solve threw an error") Theseus.solve_explicit!(cache, problem, var_anchors, perturbation=1.0)
+    @test_logs (:warn, r"Linear solve failed|Linear solve threw an error") Theseus.solve_FDM!(cache, problem, var_anchors, perturbation=1.0)
     # With perturbation of 1.0 on diagonal, A = I. x should be Pn.
     @test cache.x ≈ Pn atol=1e-10
 end

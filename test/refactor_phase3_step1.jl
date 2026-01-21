@@ -35,7 +35,7 @@ end
     copyto!(cache.q, ones(N))
     
     # 1. Forward Pass (Factorizes matrix)
-    Theseus.solve_explicit!(cache, prob, zeros(0,3))
+    Theseus.solve_FDM!(cache, prob, zeros(0,3))
     
     # 2. Adjoint Pass (Reuse factors)
     dJ_dx = randn(size(cache.x))

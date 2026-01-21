@@ -5,6 +5,7 @@ using BenchmarkTools
 using ADTypes
 using DifferentiationInterface
 import Mooncake
+using TimerOutputs
 
 function create_grid_problem(M, N)
     # M x N grid
@@ -156,6 +157,13 @@ function benchmark_loop(M, N)
     a_grad = @allocated DifferentiationInterface.value_and_gradient!(objective, G, prep, backend, θ0)
     println("Gradient:  $(round(t_grad*1000, digits=3)) ms ($(round(a_grad/1024, digits=1)) KB)")
     
+    # Show breakdown for ONE gradient call
+    reset_timer!(state.cache.to)
+    DifferentiationInterface.value_and_gradient!(objective, G, prep, backend, θ0)
+    println("\nBreakdown for ONE Gradient call:")
+    show(state.cache.to)
+    println("\n")
+    
     # 3. Full Loop (20 iterations)
     # Warmup once
     Theseus.optimize_problem!(problem, state)
@@ -164,6 +172,13 @@ function benchmark_loop(M, N)
     q_init = copy(initial_q)
     t_loop = @belapsed Theseus.optimize_problem!($problem, Theseus.OptimizationState(copy($q_init), zeros(0, 3)))
     println("Full Loop: $(round(t_loop*1000, digits=3)) ms (20 iters)")
+    
+    # Capture one granular run separately to show the breakdown
+    granular_state = Theseus.OptimizationState(copy(q_init), zeros(0, 3))
+    Theseus.optimize_problem!(problem, granular_state)
+    println("\nGranular Breakdown (per optimize_problem! call):")
+    show(granular_state.cache.to)
+    println()
 end
 
 # Warmup everything first with a tiny problem

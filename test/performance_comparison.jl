@@ -28,7 +28,7 @@ function create_benchmark_problem(N)
     return Theseus.OptimizationProblem(topo, loads, geometry, anchors, params)
 end
 
-function old_solve_explicit(q, Cn, Cf, Pn, Nf)
+function old_solve_FDM(q, Cn, Cf, Pn, Nf)
     # Correct broadcasting: q is length ne, Cn is ne x nn_free.
     # We want to scale each ROW of Cn by q. 
     # In Julia, A .* v scales ROWS if v is a vector? No, that's columns.
@@ -58,15 +58,15 @@ function compare_performance(N)
     # Cn is ne x nn_free. q is ne. Julia 1.12+ supports broadcasting Cn .* q.
     # In old code: Cnq = Cn .* q. 
     # Warmup
-    old_solve_explicit(q, Cn, Cf, Pn, Nf_fixed)
-    t_old = @belapsed old_solve_explicit($q, $Cn, $Cf, $Pn, $Nf_fixed)
-    a_old = @allocated old_solve_explicit(q, Cn, Cf, Pn, Nf_fixed)
+    old_solve_FDM(q, Cn, Cf, Pn, Nf_fixed)
+    t_old = @belapsed old_solve_FDM($q, $Cn, $Cf, $Pn, $Nf_fixed)
+    a_old = @allocated old_solve_FDM(q, Cn, Cf, Pn, Nf_fixed)
     
     # 2. New Implementation
     # Warmup
-    Theseus.solve_explicit!(cache, prob, var_anchors)
-    t_new = @belapsed Theseus.solve_explicit!($cache, $prob, $var_anchors)
-    a_new = @allocated Theseus.solve_explicit!(cache, prob, var_anchors)
+    Theseus.solve_FDM!(cache, q, prob, var_anchors)
+    t_new = @belapsed Theseus.solve_FDM!($cache, $q, $prob, $var_anchors)
+    a_new = @allocated Theseus.solve_FDM!(cache, q, prob, var_anchors)
     
     println("Old (Backslash): $(round(t_old*1000, digits=2)) ms, $a_old bytes")
     println("New (In-place) : $(round(t_new*1000, digits=2)) ms, $a_new bytes")

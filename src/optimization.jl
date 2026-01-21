@@ -4,79 +4,51 @@ import Mooncake
 import ADTypes
 import DifferentiationInterface
 using Logging
+using TimerOutputs
 
-struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
-    xyz_free::TF
-    xyz_fixed::TX
-    xyz_full::TA
-    member_lengths::VL
-    member_forces::VF
-    reactions::TR
-end
-
-function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::Union{Nothing, OptimizationCache}=nothing)
-    if isnothing(cache)
-        all_fixed = current_fixed_positions(problem, anchor_positions)
-        fixed_positions = all_fixed[problem.topology.fixed_node_indices, :]
-        xyz_free = solve_FDM(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
+function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::OptimizationCache)
+    # In-place update of cache buffers
+    solve_FDM!(cache, q, problem, anchor_positions)
+    xyz_full = cache.Nf
+    ne = length(cache.member_lengths)
+    for i in 1:ne
+        s = cache.edge_starts[i]
+        e = cache.edge_ends[i]
         
-        # Assemble xyz_full
-        nn = problem.topology.num_nodes
-        dim = size(all_fixed, 2)
-        T = promote_type(eltype(xyz_free), eltype(fixed_positions))
-        xyz_full = zeros(T, nn, dim)
+        dx = xyz_full[e, 1] - xyz_full[s, 1]
+        dy = xyz_full[e, 2] - xyz_full[s, 2]
+        dz = xyz_full[e, 3] - xyz_full[s, 3]
         
-        xyz_full[problem.topology.free_node_indices, :] .= xyz_free
-        xyz_full[problem.topology.fixed_node_indices, :] .= fixed_positions
-        
-        xyz_fixed = fixed_positions
-        member_vectors = problem.topology.incidence * xyz_full
-        member_lengths = map(norm, eachrow(member_vectors))
-        member_forces = q .* member_lengths
-        reactions = anchor_reactions(problem.topology, q, xyz_full)
-        return GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, member_lengths, member_forces, reactions)
-    else
-        # In-place update of cache buffers
-        solve_FDM!(cache, q, problem, anchor_positions)
-        xyz_full = cache.Nf
-        ne = length(cache.member_lengths)
-        for i in 1:ne
-            s = cache.edge_starts[i]
-            e = cache.edge_ends[i]
-            
-            dx = xyz_full[e, 1] - xyz_full[s, 1]
-            dy = xyz_full[e, 2] - xyz_full[s, 2]
-            dz = xyz_full[e, 3] - xyz_full[s, 3]
-            
-            len = sqrt(dx^2 + dy^2 + dz^2)
-            cache.member_lengths[i] = len
-            cache.member_forces[i] = q[i] * len
-        end
-
-        fill!(cache.reactions, 0.0)
-        for i in 1:ne
-            s = cache.edge_starts[i]
-            e = cache.edge_ends[i]
-            qi = q[i]
-            
-            rx = (xyz_full[e, 1] - xyz_full[s, 1]) * qi
-            ry = (xyz_full[e, 2] - xyz_full[s, 2]) * qi
-            rz = (xyz_full[e, 3] - xyz_full[s, 3]) * qi
-            
-            cache.reactions[s, 1] += rx
-            cache.reactions[s, 2] += ry
-            cache.reactions[s, 3] += rz
-            
-            cache.reactions[e, 1] -= rx
-            cache.reactions[e, 2] -= ry
-            cache.reactions[e, 3] -= rz
-        end
-
-        xyz_free = @view xyz_full[problem.topology.free_node_indices, :]
-        xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
-        
-        return GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, cache.member_lengths, cache.member_forces, cache.reactions)
+        len = sqrt(dx^2 + dy^2 + dz^2)
+        cache.member_lengths[i] = len
+        cache.member_forces[i] = q[i] * len
     end
+
+    fill!(cache.reactions, 0.0)
+    for i in 1:ne
+        s = cache.edge_starts[i]
+        e = cache.edge_ends[i]
+        qi = q[i]
+        
+        rx = (xyz_full[e, 1] - xyz_full[s, 1]) * qi
+        ry = (xyz_full[e, 2] - xyz_full[s, 2]) * qi
+        rz = (xyz_full[e, 3] - xyz_full[s, 3]) * qi
+        
+        cache.reactions[s, 1] += rx
+        cache.reactions[s, 2] += ry
+        cache.reactions[s, 3] += rz
+        
+        cache.reactions[e, 1] -= rx
+        cache.reactions[e, 2] -= ry
+        cache.reactions[e, 3] -= rz
+    end
+
+    xyz_free = @view xyz_full[problem.topology.free_node_indices, :]
+    xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
+    
+    snapshot = GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, cache.member_lengths, cache.member_forces, cache.reactions)
+    cache.last_snapshot = snapshot
+    return snapshot
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -139,6 +111,9 @@ end
 objective_loss(::AbstractObjective, snapshot::GeometrySnapshot) = zero(eltype(snapshot.member_lengths))
 
 function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, snapshot::GeometrySnapshot)
+    # Note: we use state.cache.to if we have access to it, but total_loss 
+    # doesn't take cache. We could pass it, but for now we'll just sum.
+    # Actually, evaluate_geometry already updated the cache.
     loss = zero(eltype(snapshot.member_lengths))
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
@@ -196,6 +171,7 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     if isnothing(state.cache)
         state.cache = OptimizationCache(problem)
     end
+    reset_timer!(state.cache.to)
 
     # Clear traces
     empty!(state.loss_trace)
@@ -238,12 +214,14 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
         state.iterations = os.iteration
         
         # Unpack current θ
-        q, anchors = unpack_parameters(problem, os.metadata["x"])
-        state.force_densities = copy(q)
-        state.variable_anchor_positions = copy(anchors)
-        
-        # snapshot using cache for visualization efficiency
-        snapshot = evaluate_geometry(problem, q, anchors, state.cache)
+        # Note: We don't perform a NEW evaluation here because fg!/objective already did it
+        # and stored the result in state.cache.last_snapshot
+        snapshot = state.cache.last_snapshot
+        q = snapshot.member_forces ./ snapshot.member_lengths # approximate q if needed, but better to get from metadata if possible
+        # Actually, let's just use the metadata x if we really need q, anchors for state
+        q_new, anchors_new = unpack_parameters(problem, os.metadata["x"])
+        state.force_densities = q_new
+        state.variable_anchor_positions = anchors_new
         
         push!(state.loss_trace, os.value)
         penalty = pBounds(os.metadata["x"], lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_sharpness, solver.barrier_sharpness)
@@ -265,8 +243,10 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
         LBFGS(),
         Optim.Options(
             iterations = solver.max_iterations,
-            f_abstol = solver.absolute_tolerance,
-            f_reltol = solver.relative_tolerance,
+            f_abstol = solver.absolute_tolerance, # Change in objective
+            f_reltol = solver.relative_tolerance, # Relative change in objective
+            g_abstol = solver.absolute_tolerance, # Gradient norm
+            g_tol = solver.relative_tolerance,    # Gradient tolerance (often used as relative)
             callback = callback,
             extended_trace = true
         ),
@@ -276,7 +256,8 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     q, anchors = unpack_parameters(problem, min_θ)
     state.force_densities = copy(q)
     state.variable_anchor_positions = copy(anchors)
-    snapshot = evaluate_geometry(problem, q, anchors)
+    # One last evaluation with the cache to ensure state is consistent and get the final snapshot
+    snapshot = evaluate_geometry(problem, q, anchors, state.cache)
 
     return result, snapshot
 end
