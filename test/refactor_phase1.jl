@@ -3,6 +3,7 @@ using Theseus
 using SparseArrays
 using LinearSolve
 using Mooncake
+using LDLFactorizations
 
 @testset "Refactor Phase 1: Foundation & OptimizationCache" begin
     # Create a small dummy problem
@@ -60,15 +61,11 @@ using Mooncake
         # Edge 2 (free-fixed) should map to 1 entry: (2,2)
         @test length(cache.q_to_nz[2]) == 1
         
-        @test cache.integrator isa LinearSolve.LinearCache
+        @test cache.factor isa LDLFactorizations.LDLFactorization
         
         # Verify buffers
         @test size(cache.x) == (2, 3)
         @test size(cache.λ) == (2, 3)
         @test size(cache.q) == (2,)
-        
-        # Verify Mooncake fdata buffers
-        @test size(cache.x_fdata) == (2, 3)
-        @test size(cache.q_fdata) == (2,)
     end
 end
