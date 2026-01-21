@@ -50,7 +50,7 @@ function create_tiny_problem()
     return Theseus.OptimizationProblem(topo, loads, geom, anchors, params)
 end
 
-println("--- Testing Mooncake integration (Zygote-free) ---")
+println("--- Testing Mooncake integration ---")
 problem = create_tiny_problem()
 q_init = [1.0, 1.0]
 state = Theseus.OptimizationState(q_init, problem.anchors.initial_variable_positions)
