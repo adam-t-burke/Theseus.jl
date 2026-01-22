@@ -6,6 +6,7 @@ Modules = [Theseus]
 
 ```@docs
 Theseus.maxPenalty
+Theseus.combineSorted
 Theseus.forceVar
 Theseus.lenVar
 Theseus.rigidSetCompare

@@ -51,7 +51,3 @@ start!()
 ```
 
 Then press enter. A message that the server has opened should appear. Theseus is now running, you can go back into Grasshopper and set up your networks for form-finding and optimization with Ariadne.
-
-## Technical Details
-
-Theseus uses [Mooncake.jl](https://github.com/comp-bio-aging/Mooncake.jl) for reverse-mode automatic differentiation, integrated via [DifferentiationInterface.jl](https://github.com/gdalle/DifferentiationInterface.jl). The optimization is performed using [Optim.jl](https://github.com/JuliaNLSolvers/Optim.jl) with the L-BFGS algorithm. The core structural solver uses the Force Density Method (FDM) with custom adjoint rules for high-performance gradient computation.
