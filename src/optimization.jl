@@ -1,47 +1,35 @@
 using LinearAlgebra
 using Optim
-import Mooncake
-import ADTypes
-import DifferentiationInterface
+using Mooncake
+using ChainRulesCore: ignore_derivatives
 using Logging
-using TimerOutputs
+using CUDA
 
-function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::OptimizationCache)
-    # In-place update of cache buffers
-    solve_FDM!(cache, q, problem, anchor_positions)
-    xyz_full = cache.Nf
-    ne = length(cache.member_lengths)
-    for i in 1:ne
-        s = cache.edge_starts[i]
-        e = cache.edge_ends[i]
-        
-        dx = xyz_full[e, 1] - xyz_full[s, 1]
-        dy = xyz_full[e, 2] - xyz_full[s, 2]
-        dz = xyz_full[e, 3] - xyz_full[s, 3]
-        
-        len = sqrt(dx^2 + dy^2 + dz^2)
-        cache.member_lengths[i] = len
-        cache.member_forces[i] = q[i] * len
-    end
+"""
+    evaluate_geometry!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
 
-    fill!(cache.reactions, 0.0)
-    for i in 1:ne
-        s = cache.edge_starts[i]
-        e = cache.edge_ends[i]
-        qi = q[i]
-        
-        rx = (xyz_full[e, 1] - xyz_full[s, 1]) * qi
-        ry = (xyz_full[e, 2] - xyz_full[s, 2]) * qi
-        rz = (xyz_full[e, 3] - xyz_full[s, 3]) * qi
-        
-        cache.reactions[s, 1] += rx
-        cache.reactions[s, 2] += ry
-        cache.reactions[s, 3] += rz
-        
-        cache.reactions[e, 1] -= rx
-        cache.reactions[e, 2] -= ry
-        cache.reactions[e, 3] -= rz
-    end
+In-place geometry evaluation using GPU kernels.
+"""
+function evaluate_geometry!(cache::FDMCache, q::AbstractVector{Float64}, problem::OptimizationProblem)
+    # 1. Solve FDM on CPU
+    x_free = solve_fdm!(cache, q, problem)
+    
+    # 2. Update GPU buffers
+    # Sync nodal positions to x_gpu
+    fixed_pos = current_fixed_positions(problem, zeros(0,3))
+    copyto!(cache.x_gpu, [x_free; fixed_pos]) # Ideally this should be more direct
+    
+    # Sync q to q_gpu
+    copyto!(cache.q_gpu, q)
+    
+    # 3. Compute L and F on GPU
+    n_edges = size(cache.edge_nodes, 1)
+    threads = 256
+    blocks = ceil(Int, n_edges / threads)
+    @cuda threads=threads blocks=blocks kernel_compute_geometry!(cache.x_gpu, cache.edge_nodes, cache.q_gpu, cache.L_gpu, cache.F_gpu)
+    
+    return x_free
+end
 
     xyz_free = @view xyz_full[problem.topology.free_node_indices, :]
     xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
@@ -183,81 +171,86 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     lower_bounds, upper_bounds = parameter_bounds(problem)
     θ0 = pack_parameters(problem, state)
     
-    # Precompute barrier indices
-    lb_idx = findall(isfinite, lower_bounds)
-    ub_idx = findall(isfinite, upper_bounds)
-    
-    # check initial bounds
-    initial_violations_lower = θ0[lb_idx] .< lower_bounds[lb_idx]
-    initial_violations_upper = θ0[ub_idx] .> upper_bounds[ub_idx]
-    if any(initial_violations_lower) || any(initial_violations_upper)
-        @warn "Initial guess is outside bounds" num_lower=sum(initial_violations_lower) num_upper=sum(initial_violations_upper)
+    # Initialize cache if needed
+    if state.cache === nothing
+        state.cache = initialize_fdm_cache(problem)
+    end
+    cache = state.cache
+
+    # Phase 1: ADMM (Global Search)
+    if solver.use_admm
+        @info "Starting ADMM Global Search..."
+        run_admm!(problem, state, cache, θ0; on_iteration=on_iteration)
+        θ0 = pack_parameters(problem, state) # Update start for L-BFGS
     end
 
-    objective = form_finding_objective(problem, state.cache, lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_weight, solver.barrier_sharpness)
-    
-    # Setup Mooncake backend via DifferentiationInterface
-    backend = ADTypes.AutoMooncake(config=Mooncake.Config(friendly_tangents=true))
-    prep = DifferentiationInterface.prepare_gradient(objective, backend, θ0)
-    
-    function fg!(F, G, θ)
-        if G !== nothing
-            val, _ = DifferentiationInterface.value_and_gradient!(objective, G, prep, backend, θ)
-            return val
-        elseif F !== nothing
-            return objective(θ)
+    # Phase 2: L-BFGS (Local Refinement)
+    if solver.use_lbfgs
+        @info "Starting L-BFGS Refinement..."
+        # Precompute barrier indices
+        lb_idx = findall(isfinite, lower_bounds)
+        ub_idx = findall(isfinite, upper_bounds)
+        
+        # check initial bounds
+        initial_violations_lower = θ0[lb_idx] .< lower_bounds[lb_idx]
+        initial_violations_upper = θ0[ub_idx] .> upper_bounds[ub_idx]
+        if any(initial_violations_lower) || any(initial_violations_upper)
+            @warn "Initial guess is outside bounds" num_lower=sum(initial_violations_lower) num_upper=sum(initial_violations_upper)
         end
-        return nothing
-    end
-    
-    callback = function (os)
-        state.iterations = os.iteration
-        
-        # Unpack current θ
-        # Note: We don't perform a NEW evaluation here because fg!/objective already did it
-        # and stored the result in state.cache.last_snapshot
-        snapshot = state.cache.last_snapshot
-        q = snapshot.member_forces ./ snapshot.member_lengths # approximate q if needed, but better to get from metadata if possible
-        # Actually, let's just use the metadata x if we really need q, anchors for state
-        q_new, anchors_new = unpack_parameters(problem, os.metadata["x"])
-        state.force_densities = q_new
-        state.variable_anchor_positions = anchors_new
-        
-        push!(state.loss_trace, os.value)
-        penalty = pBounds(os.metadata["x"], lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_sharpness, solver.barrier_sharpness)
-        push!(state.penalty_trace, penalty * solver.barrier_weight)
-        
-        if problem.parameters.tracing.record_nodes
-            push!(state.node_trace, copy(snapshot.xyz_full))
-        end
-        
-        if on_iteration !== nothing
-            on_iteration(state, snapshot, os.value)
-        end
-        return false
-    end
-    
-    result = Optim.optimize(
-        Optim.only_fg!(fg!),
-        θ0,
-        LBFGS(),
-        Optim.Options(
-            iterations = solver.max_iterations,
-            f_abstol = solver.absolute_tolerance, # Change in objective
-            f_reltol = solver.relative_tolerance, # Relative change in objective
-            g_abstol = solver.absolute_tolerance, # Gradient norm
-            g_tol = solver.relative_tolerance,    # Gradient tolerance (often used as relative)
-            callback = callback,
-            extended_trace = true
-        ),
-    )
 
-    min_θ = Optim.minimizer(result)
-    q, anchors = unpack_parameters(problem, min_θ)
-    state.force_densities = copy(q)
-    state.variable_anchor_positions = copy(anchors)
-    # One last evaluation with the cache to ensure state is consistent and get the final snapshot
-    snapshot = evaluate_geometry(problem, q, anchors, state.cache)
+        # Auto-scaling
+        geo_scale = 1.0
+        if solver.use_auto_scaling
+            q0, a0 = unpack_parameters(problem, θ0)
+            snap0 = evaluate_geometry(problem, q0, a0)
+            L0 = total_loss(problem, q0, a0, snap0)
+            geo_scale = 1.0 / max(L0, 1e-6)
+        end
 
-    return result, snapshot
+        objective = form_finding_objective(problem, state, lower_bounds, upper_bounds, lb_idx, ub_idx, geo_scale, solver.barrier_weight, solver.barrier_sharpness)
+        gradient! = make_gradient(objective)
+        
+        outer_iter = Ref(0)
+        callback = function (_opt_state)
+            outer_iter[] += 1
+            state.iterations = outer_iter[]
+            if on_iteration === nothing || isempty(state.loss_trace)
+                return false
+            end
+            snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
+            loss = state.loss_trace[end]
+            on_iteration(state, snapshot, loss)
+            return false
+        end
+        
+        result = Optim.optimize(
+            objective,
+            gradient!,
+            θ0,
+            LBFGS(),
+            Optim.Options(
+                iterations = solver.max_iterations,
+                f_abstol = solver.absolute_tolerance,
+                f_reltol = solver.relative_tolerance,
+                callback = callback,
+            ),
+        )
+
+        min_θ = Optim.minimizer(result)
+        q, anchors = unpack_parameters(problem, min_θ)
+        state.force_densities = copy(q)
+        state.variable_anchor_positions = copy(anchors)
+        snapshot = evaluate_geometry(problem, q, anchors)
+
+        return result, snapshot
+    end
+
+    # If only ADMM ran, we still return a result
+    return :ADMM_ONLY, evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
+end
+
+function run_admm!(problem::OptimizationProblem, state::OptimizationState, cache::FDMCache, θ0; on_iteration=nothing)
+    @info "ADMM implementation in progress..."
+    # TODO: Implement ADMM consensus loop
+    return state
 end

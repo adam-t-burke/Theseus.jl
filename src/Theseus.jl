@@ -5,24 +5,17 @@ using Statistics
 using SparseArrays
 using Optim
 using Mooncake
-using ADTypes
-using DifferentiationInterface
-using LinearSolve
-using LDLFactorizations
-using SparseDiffTools
-using MKL
 using JSON3
 using HTTP
 using LineSearches
 using ChainRulesCore
-
-function __init__()
-    if isdefined(Main, :MKL) || (isdefined(Base, :MKL) && Base.MKL isa Module)
-        MKL.set_num_threads(1)
-    end
-end
+using CUDA
+using LinearSolve
+using LDLFactorizations
+using MKL
 
 include("types.jl")
+include("kernels.jl")
 include("FDM.jl")
 include("optimization.jl")
 include("analysis.jl")
@@ -31,5 +24,10 @@ include("objectives.jl")
 include("adjoint.jl")
 
 export start!
+
+function __init__()
+    # Prevent thread contention during hybrid CPU/GPU execution
+    MKL.set_num_threads(1)
+end
 
 end # module Theseus
