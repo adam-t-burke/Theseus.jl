@@ -253,6 +253,14 @@ function anchor_reactions(topo::NetworkTopology, q::AbstractVector{<:Real}, xyz:
     end
 end
 
+function anchor_reactions!(ctx::FDMContext, topo::NetworkTopology, q::AbstractVector{<:Real})
+    n_free = length(topo.free_node_indices)
+    ctx.reactions .= 0.0
+    # Reactions on fixed nodes: -Cf' * diag(q) * member_vectors
+    # Diagonal(q) * ctx.member_vectors scales rows of member_vectors by q
+    ctx.reactions[n_free+1:end, :] .= -topo.fixed_incidence' * (Diagonal(q) * ctx.member_vectors)
+end
+
 """
     reaction_direction_misalignment(reaction, target_dir)
 

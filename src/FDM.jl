@@ -93,3 +93,39 @@ function solve_FDM!(cache::OptimizationCache, problem::OptimizationProblem, vari
     solve_FDM!(cache, cache.q, problem, variable_anchor_positions)
 end
 
+function update_factorization!(ctx::FDMContext{T}) where {T}
+    try
+        cholesky!(ctx.factorization, ctx.K)
+        ctx.is_chol = true
+    catch
+        ldlt!(ctx.factorization, ctx.K)
+        ctx.is_chol = false
+    end
+end
+
+function solve_explicit!(
+    ctx::FDMContext{T},
+    q::AbstractVector{<:Real},
+    Cn::SparseMatrixCSC{Int, Int},
+    Cf::SparseMatrixCSC{Int, Int},
+    Pn::AbstractMatrix{<:Real},
+    Nf::AbstractMatrix{<:Real}
+    ) where {T}
+    
+    # Update K
+    # Using a slightly allocating but efficient update for now
+    ctx.K = Cn' * (Diagonal(q) * Cn)
+    
+    # Update Factorization
+    update_factorization!(ctx)
+    
+    # Form RHS
+    # (Diagonal(q) * Cf) * Nf scales rows of Cf by q, then multiplies by Nf
+    ctx.rhs .= Pn .- Cn' * (Diagonal(q) * (Cf * Nf))
+    
+    # In-place solve
+    ldiv!(ctx.xyz_free, ctx.factorization, ctx.rhs)
+    
+    return ctx.xyz_free
+end
+

@@ -142,12 +142,90 @@ end
 
 AnchorInfo(reference_positions::Matrix{Float64}) = AnchorInfo(Int[], collect(1:size(reference_positions, 1)), reference_positions, zeros(0, 3))
 
-struct OptimizationProblem
+struct GeometrySnapshot
+    xyz_free::Matrix{Float64}
+    xyz_fixed::Matrix{Float64}
+    xyz_full::Matrix{Float64}
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+    reactions::Matrix{Float64}
+end
+
+mutable struct FDMContext{TFact}
+    # Matrices
+    K::SparseMatrixCSC{Float64, Int64}
+    factorization::TFact
+    
+    # Primal Buffers
+    rhs::Matrix{Float64}
+    xyz_free::Matrix{Float64}
+    fixed_positions::Matrix{Float64}
+    xyz_full::Matrix{Float64}
+    
+    member_vectors::Matrix{Float64}
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+    reactions::Matrix{Float64}
+    
+    # Adjoint Buffers
+    adj_xyz_full::Matrix{Float64}
+    adj_xyz_free::Matrix{Float64}
+    adj_q::Vector{Float64}
+    adj_rhs::Matrix{Float64}
+    adj_anchor_positions::Matrix{Float64}
+
+    # Solver mode (true for cholesky, false for ldlt)
+    is_chol::Bool
+end
+
+function FDMContext(topo::NetworkTopology, loads::LoadData, anchors::AnchorInfo)
+    ne = topo.num_edges
+    nn = topo.num_nodes
+    nf = length(topo.free_node_indices)
+    nx = length(topo.fixed_node_indices)
+    dim = 3
+    
+    # K matrix pattern initialization
+    q_init = ones(ne)
+    K = topo.free_incidence' * (Diagonal(q_init) * topo.free_incidence)
+    
+    # Initial factorization (numerical doesn't matter much yet, but patterns do)
+    # We use ldlt as baseline because it handles indefinite matrices
+    factorization = ldlt(K)
+    
+    rhs = zeros(nf, dim)
+    xyz_free = zeros(nf, dim)
+    fixed_positions = zeros(nx, dim)
+    xyz_full = zeros(nn, dim)
+    
+    member_vectors = zeros(ne, dim)
+    member_lengths = zeros(ne)
+    member_forces = zeros(ne)
+    reactions = zeros(nn, dim)
+    
+    adj_xyz_full = zeros(nn, dim)
+    adj_xyz_free = zeros(nf, dim)
+    adj_q = zeros(ne)
+    adj_rhs = zeros(nf, dim)
+    nvar = length(anchors.variable_indices)
+    adj_anchor_positions = zeros(nvar, dim)
+    
+    return FDMContext{typeof(factorization)}(
+        K, factorization,
+        rhs, xyz_free, fixed_positions, xyz_full,
+        member_vectors, member_lengths, member_forces, reactions,
+        adj_xyz_full, adj_xyz_free, adj_q, adj_rhs, adj_anchor_positions,
+        false
+    )
+end
+
+struct OptimizationProblem{TFact}
     topology::NetworkTopology
     loads::LoadData
     geometry::GeometryData
     anchors::AnchorInfo
     parameters::OptimizationParameters
+    context::FDMContext{TFact}
 end
 
 struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
@@ -364,6 +442,13 @@ end
 function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
     dest = zeros(eltype(anchor_positions), problem.topology.num_nodes, 3)
     current_fixed_positions!(dest, problem, anchor_positions)
+end
+
+function update_fixed_positions!(ctx::FDMContext, anchor::AnchorInfo, variable_anchor_positions::AbstractMatrix{<:Real})
+    ctx.fixed_positions .= anchor.reference_positions
+    if !isempty(anchor.variable_indices)
+        ctx.fixed_positions[anchor.variable_indices, :] .= variable_anchor_positions
+    end
 end
 
 current_fixed_positions(problem::OptimizationProblem, state::OptimizationState) =
@@ -650,7 +735,9 @@ function build_problem(problem::JSON3.Object)
     q_values = build_force_densities(Float64.(problem["Q"]), topo.num_edges)
     q_init = q_values
 
-    problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
+    context = FDMContext(topo, loads, anchors)
+
+    problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters, context)
     state = OptimizationState(q_init, anchors.initial_variable_positions)
     state.cache = OptimizationCache(problem_struct)
 

@@ -118,25 +118,36 @@ function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anc
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
     end
-    loss
+    return loss
 end
 
-function pack_parameters(problem::OptimizationProblem, state::OptimizationState)
+function pack_parameters(problem::OptimizationProblem{T}, state::OptimizationState) where {T}
     if isempty(problem.anchors.variable_indices)
         return copy(state.force_densities)
     end
-    vcat(state.force_densities, vec(state.variable_anchor_positions))
+    return vcat(state.force_densities, vec(state.variable_anchor_positions))
 end
 
-function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) where {T<:Real}
+function unpack_parameters(problem::OptimizationProblem{T}, θ::AbstractVector{S}) where {T, S<:Real}
     ne = problem.topology.num_edges
     q = copy(@view θ[1:ne])
     nvar = length(problem.anchors.variable_indices)
     if nvar == 0
-        return q, zeros(T, 0, 3)
+        return q, zeros(S, 0, 3)
     end
     anchors = reshape(copy(@view θ[ne + 1:end]), 3, nvar)'
-    q, anchors
+    return q, collect(anchors)
+end
+
+function log_trace_info!(trace_state::OptimizationState, q::AbstractVector{Float64}, anchors::AbstractMatrix{Float64}, geometric_loss::Float64, barrier_loss::Float64, snapshot::GeometrySnapshot)
+    trace_state.force_densities .= q
+    if !isempty(anchors)
+        trace_state.variable_anchor_positions .= anchors
+    end
+    push!(trace_state.loss_trace, geometric_loss)
+    push!(trace_state.penalty_trace, barrier_loss)
+    # push!(trace_state.node_trace, copy(snapshot.xyz_full))
+    return nothing
 end
 
 function form_finding_objective(problem::OptimizationProblem, cache::OptimizationCache, lb, ub, lb_idx, ub_idx, barrier_weight, sharpness)
