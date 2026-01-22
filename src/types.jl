@@ -137,7 +137,7 @@ struct Bounds
     upper::Vector{Float64}
 end
 
-struct SolverOptions
+Base.@kwdef struct SolverOptions
     absolute_tolerance::Float64
     relative_tolerance::Float64
     max_iterations::Int
@@ -152,12 +152,12 @@ struct SolverOptions
     rho::Float64
 end
 
-struct TracingOptions
+Base.@kwdef struct TracingOptions
     record_nodes::Bool
     emit_frequency::Int
 end
 
-struct OptimizationParameters
+Base.@kwdef struct OptimizationParameters
     objectives::Vector{AbstractObjective}
     bounds::Bounds
     solver::SolverOptions
@@ -199,6 +199,160 @@ struct OptimizationProblem
     parameters::OptimizationParameters
 end
 
+struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
+    xyz_free::TF
+    xyz_fixed::TX
+    xyz_full::TA
+    member_lengths::VL
+    member_forces::VF
+    reactions::TR
+end
+
+mutable struct OptimizationCache
+    # CPU Solver
+    A::SparseMatrixCSC{Float64, Int64}
+    factor::LDLFactorizations.LDLFactorization{Float64, Int64}
+    q_to_nz::Vector{Vector{Tuple{Int, Float64}}} # maps edge index -> indices and coeffs in A.nzval
+    edge_starts::Vector{Int} # node index (1..nn)
+    edge_ends::Vector{Int}   # node index (1..nn)
+    node_to_free_idx::Vector{Int} # node index (1..nn) -> index in Cn (0 if fixed)
+
+    # Constant topology buffers
+    Cn::SparseMatrixCSC{Float64, Int64}
+    Cf::SparseMatrixCSC{Float64, Int64}
+
+    # Buffers (primal)
+    x::Matrix{Float64}
+    λ::Matrix{Float64}
+    grad_x::Matrix{Float64}
+    q::Vector{Float64}
+    grad_q::Vector{Float64}
+    grad_Nf::Matrix{Float64} # Gradient w.r.t. fixed node positions
+    
+    # Primal result buffers
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+    reactions::Matrix{Float64}
+
+    # Intermediate buffers for RHS
+    Cf_Nf::Matrix{Float64}
+    Q_Cf_Nf::Matrix{Float64}
+    Pn::Matrix{Float64}
+    Nf::Matrix{Float64} # Buffer for current full node positions
+    Nf_fixed::Matrix{Float64} # Dense buffer for fixed nodes only
+
+    # Profiling and state
+    to::TimerOutput
+    last_snapshot::Union{Nothing, GeometrySnapshot}
+
+    function OptimizationCache(problem::OptimizationProblem)
+        topo = problem.topology
+        Cn = convert(SparseMatrixCSC{Float64, Int64}, topo.free_incidence)
+        Cf = convert(SparseMatrixCSC{Float64, Int64}, topo.fixed_incidence)
+        ne = topo.num_edges
+        nn_free = length(topo.free_node_indices)
+
+        # 1. Construct sparsity pattern for A = Cn' * diag(q) * Cn
+        A_template = sparse(Cn' * Cn)
+        nz = nnz(A_template)
+        A = SparseMatrixCSC{Float64, Int64}(A_template.m, A_template.n, A_template.colptr, A_template.rowval, zeros(nz))
+        
+        # Mapping from edge to nzval indices
+        q_to_nz = [Tuple{Int, Float64}[] for _ in 1:ne]
+        edge_starts = zeros(Int, ne)
+        edge_ends = zeros(Int, ne)
+        node_to_free_idx = zeros(Int, topo.num_nodes)
+        for (i, node_idx) in enumerate(topo.free_node_indices)
+            node_to_free_idx[node_idx] = i
+        end
+
+        # Pre-process incidence to get nodes of each edge
+        incidence = problem.topology.incidence
+        for col in 1:topo.num_nodes
+            for idx in incidence.colptr[col]:(incidence.colptr[col+1]-1)
+                row = incidence.rowval[idx]
+                val = incidence.nzval[idx]
+                if val == -1.0
+                    edge_starts[row] = col
+                elseif val == 1.0
+                    edge_ends[row] = col
+                end
+            end
+        end
+
+        # Pre-process Cn to get nodes of each edge
+        edge_to_nodes = [Int[] for _ in 1:ne]
+        for j in 1:nn_free
+            for idx in Cn.colptr[j]:(Cn.colptr[j+1]-1)
+                push!(edge_to_nodes[Cn.rowval[idx]], j)
+            end
+        end
+
+        for k in 1:ne
+            nodes = edge_to_nodes[k]
+            for n1 in nodes
+                # find Cn[k, n1]
+                val_n1 = 0.0
+                for idx in Cn.colptr[n1]:(Cn.colptr[n1+1]-1)
+                    if Cn.rowval[idx] == k; val_n1 = Cn.nzval[idx]; break; end
+                end
+                for n2 in nodes
+                    # find Cn[k, n2]
+                    val_n2 = 0.0
+                    for idx in Cn.colptr[n2]:(Cn.colptr[n2+1]-1)
+                        if Cn.rowval[idx] == k; val_n2 = Cn.nzval[idx]; break; end
+                    end
+                    nz_idx = find_nz_index(A, n1, n2)
+                    push!(q_to_nz[k], (nz_idx, val_n1 * val_n2))
+                end
+            end
+        end
+
+        # 2. Initialize LDLFactorization
+        # Fill diagonal to ensure initial symbolic/numeric pass works
+        for i in 1:nn_free; A.nzval[find_nz_index(A, i, i)] = 1.0; end
+        factor = LDLFactorizations.ldl(A)
+
+        # 3. Pre-allocate buffers
+        x = zeros(nn_free, 3)
+        λ = zeros(nn_free, 3)
+        grad_x = zeros(nn_free, 3)
+        q = zeros(ne)
+        grad_q = zeros(ne)
+        grad_Nf = zeros(topo.num_nodes, 3)
+        
+        member_lengths = zeros(ne)
+        member_forces = zeros(ne)
+        reactions = zeros(topo.num_nodes, 3)
+
+        Cf_Nf = zeros(ne, 3)
+        Q_Cf_Nf = zeros(ne, 3)
+        Pn = copy(problem.loads.free_node_loads)
+        Nf = zeros(topo.num_nodes, 3)
+        Nf_fixed = zeros(length(topo.fixed_node_indices), 3)
+
+        to = TimerOutput()
+        last_snapshot = nothing
+
+        new(A, factor, q_to_nz, edge_starts, edge_ends, node_to_free_idx,
+            Cn, Cf,
+            x, λ, grad_x, q, grad_q, grad_Nf,
+            member_lengths, member_forces, reactions,
+            Cf_Nf, Q_Cf_Nf, Pn, Nf, Nf_fixed,
+            to, last_snapshot)
+    end
+end
+
+# Helper to find nz index in SparseMatrixCSC
+function find_nz_index(A::SparseMatrixCSC, i::Integer, j::Integer)
+    for nz_idx in A.colptr[j]:(A.colptr[j+1]-1)
+        if A.rowval[nz_idx] == i
+            return nz_idx
+        end
+    end
+    error("Index ($i, $j) not found in sparse matrix")
+end
+
 mutable struct OptimizationState
     force_densities::Vector{Float64}
     variable_anchor_positions::Matrix{Float64}
@@ -220,19 +374,44 @@ end
 
 default_bounds(ne::Int) = Bounds(fill(1e-8, ne), fill(Inf, ne))
 
-function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
+function current_fixed_positions!(dest::AbstractMatrix{T}, problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real}) where T
     anchor = problem.anchors
     ref = anchor.reference_positions
-    T = promote_type(eltype(ref), eltype(anchor_positions))
-    if isempty(anchor.variable_indices)
-        return T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
+    fixed_indices = problem.topology.fixed_node_indices
+    
+    # 1. Overlay reference positions of fixed nodes
+    # We assume 'ref' contains positions for the nodes listed in 'fixed_indices'
+    if size(ref, 1) == length(fixed_indices)
+        for dim in 1:3
+            for (i, node_idx) in enumerate(fixed_indices)
+                dest[node_idx, dim] = ref[i, dim]
+            end
+        end
+    elseif size(ref, 1) == problem.topology.num_nodes
+        # Fallback if 'ref' is a full matrix of all nodes
+        for dim in 1:3
+            for node_idx in fixed_indices
+                dest[node_idx, dim] = ref[node_idx, dim]
+            end
+        end
+    else
+        error("Dimension mismatch: reference_positions has $(size(ref, 1)) nodes but expected either $(length(fixed_indices)) (fixed only) or $(problem.topology.num_nodes) (all).")
     end
-    positions = T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
+    
+    # 2. Overlay variable anchors
     if !isempty(anchor.variable_indices)
-        anchors_converted = eltype(anchor_positions) === T ? anchor_positions : convert(Matrix{T}, anchor_positions)
-        positions[anchor.variable_indices, :] .= anchors_converted
+        for dim in 1:3
+            for (i, node_idx) in enumerate(anchor.variable_indices)
+                dest[node_idx, dim] = anchor_positions[i, dim]
+            end
+        end
     end
-    return positions
+    return dest
+end
+
+function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
+    dest = zeros(eltype(anchor_positions), problem.topology.num_nodes, 3)
+    current_fixed_positions!(dest, problem, anchor_positions)
 end
 
 current_fixed_positions(problem::OptimizationProblem, state::OptimizationState) =
@@ -526,6 +705,7 @@ function build_problem(problem::JSON3.Object)
 
     problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
     state = OptimizationState(q_init, anchors.initial_variable_positions)
+    state.cache = OptimizationCache(problem_struct)
 
     problem_struct, state
 end

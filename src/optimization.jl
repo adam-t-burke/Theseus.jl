@@ -31,15 +31,12 @@ function evaluate_geometry!(cache::FDMCache, q::AbstractVector{Float64}, problem
     return x_free
 end
 
-function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real})
-    fixed_positions = current_fixed_positions(problem, anchor_positions)
-    xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
-    xyz_full = vcat(xyz_free, fixed_positions)
-    member_vectors = problem.topology.incidence * xyz_full
-    member_lengths = map(norm, eachrow(member_vectors))
-    member_forces = q .* member_lengths
-    reactions = anchor_reactions(problem.topology, q, xyz_full)
-    GeometrySnapshot(xyz_free, fixed_positions, xyz_full, member_lengths, member_forces, reactions)
+    xyz_free = @view xyz_full[problem.topology.free_node_indices, :]
+    xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
+    
+    snapshot = GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, cache.member_lengths, cache.member_forces, cache.reactions)
+    cache.last_snapshot = snapshot
+    return snapshot
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -64,7 +61,11 @@ end
 
 function objective_loss(obj::SumForceLengthObjective, snapshot::GeometrySnapshot)
     edges = obj.edge_indices
-    obj.weight * sum(snapshot.member_lengths[edges] .* snapshot.member_forces[edges])
+    loss = zero(eltype(snapshot.member_lengths))
+    for idx in edges
+        loss += snapshot.member_lengths[idx] * snapshot.member_forces[idx]
+    end
+    obj.weight * loss
 end
 
 function objective_loss(obj::MinLengthObjective, snapshot::GeometrySnapshot)
@@ -98,6 +99,9 @@ end
 objective_loss(::AbstractObjective, snapshot::GeometrySnapshot) = zero(eltype(snapshot.member_lengths))
 
 function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, snapshot::GeometrySnapshot)
+    # Note: we use state.cache.to if we have access to it, but total_loss 
+    # doesn't take cache. We could pass it, but for now we'll just sum.
+    # Actually, evaluate_geometry already updated the cache.
     loss = zero(eltype(snapshot.member_lengths))
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
@@ -123,33 +127,16 @@ function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) 
     q, anchors
 end
 
-function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState, lb, ub, lb_idx, ub_idx, geo_scale, barrier_weight, sharpness)
-    empty!(trace_state.loss_trace)
-    empty!(trace_state.penalty_trace)
-    empty!(trace_state.node_trace)
-    trace_state.iterations = 0
-
+function form_finding_objective(problem::OptimizationProblem, cache::OptimizationCache, lb, ub, lb_idx, ub_idx, barrier_weight, sharpness)
     function objective(θ)
         q, anchors = unpack_parameters(problem, θ)
-        snapshot = evaluate_geometry(problem, q, anchors)
+        snapshot = evaluate_geometry(problem, q, anchors, cache)
         
         geometric_loss = total_loss(problem, q, anchors, snapshot)
         barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)
         
-        loss = (geometric_loss * geo_scale) + (barrier_loss * barrier_weight)
-        
-        if !isderiving()
-            ignore_derivatives() do
-                trace_state.force_densities = copy(q)
-                trace_state.variable_anchor_positions = copy(anchors)
-                push!(trace_state.loss_trace, loss)
-                push!(trace_state.penalty_trace, barrier_loss * barrier_weight)
-                if problem.parameters.tracing.record_nodes
-                    push!(trace_state.node_trace, copy(snapshot.xyz_full))
-                end
-            end
-        end
-        loss
+        loss = geometric_loss + (barrier_loss * barrier_weight)
+        return loss
     end
 
     objective
@@ -167,15 +154,19 @@ function parameter_bounds(problem::OptimizationProblem)
     lower, upper
 end
 
-function make_gradient(objective)
-    function g!(G, θ)
-        grad = gradient(objective, θ)[1]
-        copyto!(G, grad)
-    end
-    g!
-end
-
 function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
+    # Ensure cache is initialized
+    if isnothing(state.cache)
+        state.cache = OptimizationCache(problem)
+    end
+    reset_timer!(state.cache.to)
+
+    # Clear traces
+    empty!(state.loss_trace)
+    empty!(state.penalty_trace)
+    empty!(state.node_trace)
+    state.iterations = 0
+
     solver = problem.parameters.solver
     lower_bounds, upper_bounds = parameter_bounds(problem)
     θ0 = pack_parameters(problem, state)
