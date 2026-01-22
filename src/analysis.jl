@@ -27,8 +27,11 @@ function send_message(ws, problem::OptimizationProblem{T}, state::OptimizationSt
     HTTP.WebSockets.send(ws, JSON3.write(payload))
 end
 
-function direct_solution!(problem::OptimizationProblem{T}, state::OptimizationState, ws) where {T}
-    snapshot = evaluate_geometry!(problem, state.force_densities, state.variable_anchor_positions)
+function direct_solution!(problem::OptimizationProblem, state::OptimizationState, ws)
+    if isnothing(state.cache)
+        state.cache = OptimizationCache(problem)
+    end
+    snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions, state.cache)
     empty!(state.loss_trace)
     push!(state.loss_trace, 0.0)
     send_message(ws, problem, state, snapshot;

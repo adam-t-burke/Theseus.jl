@@ -1,4 +1,6 @@
 using Test
 
 include("FDM/runtests.jl")
-include("integration/test_solve.jl")
+include("refactor_phase1.jl")
+include("test_adjoints.jl")
+

@@ -1,89 +1,174 @@
-using SparseArrays
-import Mooncake
-using Mooncake: CoDual, NoFData, NoTangent, NoRData, MutableTangent, DefaultCtx, ReverseMode, @is_primitive, @zero_adjoint
+module Adjoints
+
+using ..Theseus
 using LinearAlgebra
+using SparseArrays
+using LinearSolve
+using Mooncake
+using TimerOutputs
+using Mooncake: NoTangent, @is_primitive, ReverseMode, DefaultCtx, CoDual, NoRData, NoFData
 
-# Help Mooncake handle complex types and avoid unnecessary tag analysis
-Mooncake.tangent_type(::Type{<:SparseArrays.CHOLMOD.Factor}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{NetworkTopology}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{LoadData}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{GeometryData}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{AnchorInfo}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{OptimizationParameters}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{OptimizationState}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{<:OptimizationProblem}) = Mooncake.NoTangent
-Mooncake.tangent_type(::Type{<:ObjectiveWrapper}) = Mooncake.NoTangent
+# Make TimerOutput invisible to Mooncake to avoid recursive tangent type search
+Mooncake.tangent_type(::Type{TimerOutputs.TimerOutput}) = NoTangent
 
-@is_primitive DefaultCtx ReverseMode Tuple{typeof(update_factorization!), FDMContext}
-@is_primitive DefaultCtx ReverseMode Tuple{typeof(solve_explicit!), FDMContext, Vararg}
-@zero_adjoint DefaultCtx Tuple{typeof(log_trace_info!), OptimizationState, Vararg}
+# Register solve_FDM! as a primitive for Mooncake
+@is_primitive DefaultCtx ReverseMode Tuple{typeof(Theseus.solve_FDM!), Vararg{Any}}
 
-# Manual rule for update_factorization!
-function Mooncake.rrule!!(
-    f::CoDual{typeof(update_factorization!)},
-    ctx::CoDual
-)
-    res = update_factorization!(ctx.x)
-    function update_factorization_pullback(Δ)
-        return NoRData(), NoRData()
+"""
+    solve_adjoint!(cache::Theseus.OptimizationCache, dJ_dx::AbstractMatrix)
+
+Solves the adjoint system A^T λ = dJ_dx using the pre-factorized matrix from the forward pass.
+Since A is symmetric (C'QC), we reuse the same factorization.
+"""
+function solve_adjoint!(cache::Theseus.OptimizationCache, dJ_dx::AbstractMatrix)
+    @timeit cache.to "solve_adjoint!" begin
+        # Solve A * lambda = dJ_dx
+        # We DO NOT update cache.factor here because we want to reuse the 
+        # factors already calculated in solve_FDM!. 
+        ldiv!(cache.λ, cache.factor, dJ_dx)
     end
-    return CoDual(res, NoFData()), update_factorization_pullback
+    return nothing
 end
 
-function Mooncake.rrule!!(
-    f::CoDual{typeof(solve_explicit!)},
-    ctx::CoDual,
-    q::CoDual,
-    Cn::CoDual,
-    Cf::CoDual,
-    Pn::CoDual,
-    Nf::CoDual
-)
-    # Primal
-    solve_explicit!(ctx.x, q.x, Cn.x, Cf.x, Pn.x, Nf.x)
-    
-    function solve_explicit_pullback(Δ)
-        # Δ is the rdata of the return value (ctx.x.xyz_free), which is NoRData() for a mutable array.
-        # The actual gradient should be in the shadow memory of ctx: ctx.dx.fields.xyz_free
-        # solve adjoint system K * Λ = Δ
-        ldiv!(ctx.x.adj_rhs, ctx.x.factorization, ctx.dx.fields.xyz_free)
-        Λ = ctx.x.adj_rhs 
+"""
+    accumulate_gradients!(cache::Theseus.OptimizationCache, p::Theseus.OptimizationProblem)
+
+Computes the gradient with respect to q and Nf (fixed node positions).
+∂J/∂q_k = -Δλ_k ⋅ ΔN_k
+∂J/∂N_v += -q_k * Δλ (if v is fixed)
+"""
+function accumulate_gradients!(cache::Theseus.OptimizationCache, p::Theseus.OptimizationProblem)
+    @timeit cache.to "accumulate_gradients!" begin
+        fill!(cache.grad_q, 0.0)
+        fill!(cache.grad_Nf, 0.0)
         
-        # calculate gradients
-        # xyz_free is (n_free x 3)
-        # Cn is (n_edges x n_free)
-        # Cf is (n_edges x n_fixed)
-        # Nf is (n_fixed x 3)
-        V_full = Cn.x * ctx.x.xyz_free + Cf.x * Nf.x # (n_edges x 3)
-        V_adj = Cn.x * Λ # (n_edges x 3)
-        
-        # accumulate into q.dx
-        if !(q.dx isa NoTangent)
-            # q.dx is (n_edges,)
-            # V_full and V_adj are (n_edges x 3)
-            # we want -sum_j (V_full[i,j] * V_adj[i,j])
-            for j in 1:size(V_full, 2)
-                for i in 1:length(q.x)
-                    q.dx[i] -= V_full[i, j] * V_adj[i, j]
+        for k in 1:p.topology.num_edges
+            u = cache.edge_starts[k]
+            v = cache.edge_ends[k]
+            
+            u_free = cache.node_to_free_idx[u]
+            v_free = cache.node_to_free_idx[v]
+            
+            for d in 1:3
+                λ_u = u_free > 0 ? cache.λ[u_free, d] : 0.0
+                λ_v = v_free > 0 ? cache.λ[v_free, d] : 0.0
+                dλ = λ_v - λ_u
+                
+                # Nf contains ALL node positions (updated in solve_FDM!)
+                dN = cache.Nf[v, d] - cache.Nf[u, d]
+                
+                # ∂J/∂q_k
+                cache.grad_q[k] -= dλ * dN
+                
+                # ∂J/∂N_f
+                # Total derivative: J = f(x(q, Nf), q, Nf)
+                # We already handled dJ/dx in solve_adjoint!.
+                # Explicit dependence:
+                # -q_k * dλ is the contribution of edge k to the force at nodes.
+                term = -cache.q[k] * dλ
+                if v_free == 0
+                    cache.grad_Nf[v, d] += term
+                end
+                if u_free == 0
+                    cache.grad_Nf[u, d] -= term
                 end
             end
         end
-        
-        # update Pn.dx
-        if !(Pn.dx isa NoTangent)
-            Pn.dx .+= Λ
-        end
-        
-        # update Nf.dx
-        if !(Nf.dx isa NoTangent)
-            Nf.dx .-= Cf.x' * (Diagonal(q.x) * V_adj)
-        end
-        
-        # Zero out consumed gradient in shadow memory
-        ctx.dx.fields.xyz_free .= 0
-        
-        return NoRData(), NoRData(), NoRData(), NoRData(), NoRData(), NoRData(), NoRData()
     end
-    
-    return CoDual(ctx.x.xyz_free, ctx.dx.fields.xyz_free), solve_explicit_pullback
+    return nothing
 end
+
+# Mooncake Rule for solve_FDM!
+# We provide 4 and 5 argument versions to match solve_FDM! signatures.
+
+function _solve_FDM_pullback_common(cache_cd, q_cd, problem_cd, anchors_cd)
+    topo = problem_cd.x.topology
+    cache = cache_cd.x
+    # 1. Map gradients from Nf back to x (for free nodes)
+    @timeit cache.to "pullback map Nf->x" begin
+        for j in 1:3
+            for (i, idx) in enumerate(topo.free_node_indices)
+                cache_cd.dx.fields.x[i, j] += cache_cd.dx.fields.Nf[idx, j]
+            end
+        end
+    end
+
+    # 2. Adjoint solve
+    solve_adjoint!(cache, cache_cd.dx.fields.x)
+    
+    # 3. Accumulate: dJ/dq and dJ/dNf (indirect)
+    accumulate_gradients!(cache, problem_cd.x)
+    
+    # 4. Update argument shadows
+    @timeit cache.to "pullback update shadows" begin
+        q_cd.dx .+= cache.grad_q
+        
+        var_indices = problem_cd.x.anchors.variable_indices
+        for i in 1:length(var_indices)
+            idx = var_indices[i]
+            # Direct effect from objective on Nf
+            anchors_cd.dx[i, 1] += cache_cd.dx.fields.Nf[idx, 1]
+            anchors_cd.dx[i, 2] += cache_cd.dx.fields.Nf[idx, 2]
+            anchors_cd.dx[i, 3] += cache_cd.dx.fields.Nf[idx, 3]
+            
+            # Indirect effect from x -> Nf
+            anchors_cd.dx[i, 1] += cache.grad_Nf[idx, 1]
+            anchors_cd.dx[i, 2] += cache.grad_Nf[idx, 2]
+            anchors_cd.dx[i, 3] += cache.grad_Nf[idx, 3]
+        end
+    end
+
+    # CRITICAL: Clear tangent buffers in cache shadow to prevent accumulation across iterations
+    # We clear all major mutable buffers that are updated in the forward pass
+    @timeit cache.to "pullback zero fields" begin
+        fill!(cache_cd.dx.fields.x, 0.0)
+        fill!(cache_cd.dx.fields.Nf, 0.0)
+        fill!(cache_cd.dx.fields.q, 0.0)
+        fill!(cache_cd.dx.fields.member_lengths, 0.0)
+        fill!(cache_cd.dx.fields.member_forces, 0.0)
+        fill!(cache_cd.dx.fields.reactions, 0.0)
+    end
+    return nothing
+end
+
+function Mooncake.rrule!!(
+    f_cd::CoDual{typeof(Theseus.solve_FDM!)},
+    cache_cd::CoDual{<:Theseus.OptimizationCache},
+    q_cd::CoDual{<:AbstractVector{<:Real}},
+    problem_cd::CoDual{<:Theseus.OptimizationProblem},
+    anchors_cd::CoDual{<:Matrix{Float64}},
+    perturbation_cd::CoDual{Float64}
+)
+    Theseus.solve_FDM!(cache_cd.x, q_cd.x, problem_cd.x, anchors_cd.x, perturbation_cd.x)
+    
+    out_cd = CoDual(nothing, NoFData())
+
+    function solve_FDM_pullback_ext(dy::NoRData)
+        _solve_FDM_pullback_common(cache_cd, q_cd, problem_cd, anchors_cd)
+        return NoRData(), NoRData(), NoRData(), Mooncake.rdata(Mooncake.zero_tangent(problem_cd.x)), NoRData(), 0.0
+    end
+
+    return out_cd, solve_FDM_pullback_ext
+end
+
+function Mooncake.rrule!!(
+    f_cd::CoDual{typeof(Theseus.solve_FDM!)},
+    cache_cd::CoDual{<:Theseus.OptimizationCache},
+    q_cd::CoDual{<:AbstractVector{<:Real}},
+    problem_cd::CoDual{<:Theseus.OptimizationProblem},
+    anchors_cd::CoDual{<:Matrix{Float64}}
+)
+    Theseus.solve_FDM!(cache_cd.x, q_cd.x, problem_cd.x, anchors_cd.x)
+    
+    out_cd = CoDual(nothing, NoFData())
+
+    function solve_FDM_pullback(dy::NoRData)
+        _solve_FDM_pullback_common(cache_cd, q_cd, problem_cd, anchors_cd)
+        return NoRData(), NoRData(), NoRData(), Mooncake.rdata(Mooncake.zero_tangent(problem_cd.x)), NoRData()
+    end
+
+    return out_cd, solve_FDM_pullback
+end
+
+end # module
+  

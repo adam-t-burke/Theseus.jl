@@ -31,40 +31,50 @@ softplus(x::AbstractVector{T}, b::AbstractVector{S}, k::R) where {T<:Real,S<:Rea
 Penalizes values in vector that are below a threshold 
 """
 function minPenalty(x::AbstractVector{<:Real}, values::AbstractVector{<:Real}, indices::AbstractVector{<:Integer}, k::Real)
-    selected = x[indices]
-    mask = isfinite.(values)
-    if !any(mask)
-        return zero(eltype(selected))
+    loss = zero(eltype(x))
+    for (i, idx) in enumerate(indices)
+        v = values[i]
+        if isfinite(v)
+            loss += softplus(x[idx], v, -k)
+        end
     end
-    sum(softplus(selected[mask], values[mask], -k))
+    loss
 end
 
 function minPenalty(x::AbstractVector{<:Real}, values::AbstractVector{<:Real}, k::Real)
-    mask = isfinite.(values)
-    if !any(mask)
-        return zero(eltype(x))
+    loss = zero(eltype(x))
+    for i in 1:length(x)
+        v = values[i]
+        if isfinite(v)
+            loss += softplus(x[i], v, -k)
+        end
     end
-    sum(softplus(x[mask], values[mask], -k))
+    loss
 end
 
 """
 Penalizes values in vector that are above a threshold 
 """
 function maxPenalty(x::AbstractVector{<:Real}, values::AbstractVector{<:Real}, indices::AbstractVector{<:Integer}, k::Real)
-    selected = x[indices]
-    mask = isfinite.(values)
-    if !any(mask)
-        return zero(eltype(selected))
+    loss = zero(eltype(x))
+    for (i, idx) in enumerate(indices)
+        v = values[i]
+        if isfinite(v)
+            loss += softplus(x[idx], v, k)
+        end
     end
-    sum(softplus(selected[mask], values[mask], k))
+    loss
 end
 
 function maxPenalty(x::AbstractVector{<:Real}, values::AbstractVector{<:Real}, k::Real)
-    mask = isfinite.(values)
-    if !any(mask)
-        return zero(eltype(x))
+    loss = zero(eltype(x))
+    for i in 1:length(x)
+        v = values[i]
+        if isfinite(v)
+            loss += softplus(x[i], v, k)
+        end
     end
-    sum(softplus(x[mask], values[mask], k))
+    loss
 end
 
 """
@@ -78,11 +88,17 @@ end
 
 function pBounds(p::AbstractVector{<:Real}, lb::AbstractVector{<:Real}, ub::AbstractVector{<:Real}, lb_indices::AbstractVector{<:Integer}, ub_indices::AbstractVector{<:Integer}, kl::Real, ku::Real)
     loss = zero(eltype(p))
-    if !isempty(lb_indices)
-        loss += sum(softplus(p[lb_indices], lb[lb_indices], -kl))
+    for idx in lb_indices
+        v = lb[idx]
+        if isfinite(v)
+            loss += softplus(p[idx], v, -kl)
+        end
     end
-    if !isempty(ub_indices)
-        loss += sum(softplus(p[ub_indices], ub[ub_indices], ku))
+    for idx in ub_indices
+        v = ub[idx]
+        if isfinite(v)
+            loss += softplus(p[idx], v, ku)
+        end
     end
     loss
 end
@@ -91,7 +107,13 @@ end
 Minimze distances between selected target nodes and their corresponding nodes in the form found network.
 """
 function target_xyz(xyz::AbstractMatrix{<:Real}, target::AbstractMatrix{<:Real}, indices::AbstractVector{<:Integer})
-    sum((xyz[indices, :] .- target).^2)
+    loss = zero(eltype(xyz))
+    for (i, idx) in enumerate(indices)
+        loss += (xyz[idx, 1] - target[i, 1])^2
+        loss += (xyz[idx, 2] - target[i, 2])^2
+        loss += (xyz[idx, 3] - target[i, 3])^2
+    end
+    loss
 end
 
 """
@@ -99,7 +121,12 @@ Minimize the distance between the x and y coordinates of the target nodes and th
 Equal to targeting a plan projection of the target nodes. Useful if the target geometry variation is dominated by the x and y coordinates.
 """
 function target_xy(xyz::AbstractMatrix{<:Real}, target::AbstractMatrix{<:Real}, indices::AbstractVector{<:Integer})
-    sum((xyz[indices, 1:2] .- target[:, 1:2]).^2)
+    loss = zero(eltype(xyz))
+    for (i, idx) in enumerate(indices)
+        loss += (xyz[idx, 1] - target[i, 1])^2
+        loss += (xyz[idx, 2] - target[i, 2])^2
+    end
+    loss
 end
 
 """
@@ -107,27 +134,61 @@ Find the distance between all pairs of points in a point set. Returns a strictly
 """
 function pairDist(xyz::AbstractMatrix{<:Real})
     n = size(xyz, 1)
-    # Create the distance matrix without mutation
-    zero_val = zero(eltype(xyz))
-    [i > j ? norm(xyz[i, :] .- xyz[j, :]) : zero_val for i in 1:n, j in 1:n]
+    T = eltype(xyz)
+    dist = zeros(T, n, n)
+    for i in 1:n
+        for j in 1:(i-1)
+            dx = xyz[i, 1] - xyz[j, 1]
+            dy = xyz[i, 2] - xyz[j, 2]
+            dz = xyz[i, 3] - xyz[j, 3]
+            dist[i, j] = sqrt(dx^2 + dy^2 + dz^2)
+        end
+    end
+    return dist
 end
 
 """
 Compare the distance between all pairs of points in a target point set and the distance between all pairs of points in a form found point set.
 """
 function rigidSetCompare(xyz::AbstractMatrix{<:Real}, indices::AbstractVector{<:Integer}, target::AbstractMatrix{<:Real})
-    xyz = xyz[indices, :]
-    test_distances = pairDist(xyz)
-    target_distances = pairDist(target)
-    return sum((target_distances .- test_distances).^2)
+    loss = zero(eltype(xyz))
+    n = length(indices)
+    for i in 1:n
+        idx_i = indices[i]
+        for j in 1:(i-1)
+            idx_j = indices[j]
+            
+            # Distance in network
+            dx = xyz[idx_i, 1] - xyz[idx_j, 1]
+            dy = xyz[idx_i, 2] - xyz[idx_j, 2]
+            dz = xyz[idx_i, 3] - xyz[idx_j, 3]
+            d_network = sqrt(dx^2 + dy^2 + dz^2)
+            
+            # Distance in target
+            tx = target[i, 1] - target[j, 1]
+            ty = target[i, 2] - target[j, 2]
+            tz = target[i, 3] - target[j, 3]
+            d_target = sqrt(tx^2 + ty^2 + tz^2)
+            
+            loss += (d_target - d_network)^2
+        end
+    end
+    return loss
 end
 
 """
 Compute difference between the maximum and minimum lengths of the edges in the network.
 """
 function lenVar(x::AbstractVector{<:Real}, indices::AbstractVector{<:Integer})
-    selected = x[indices]
-    maximum(selected) - minimum(selected)
+    if isempty(indices); return zero(eltype(x)); end
+    v_min = x[indices[1]]
+    v_max = v_min
+    for i in 2:length(indices)
+        v = x[indices[i]]
+        if v < v_min; v_min = v; end
+        if v > v_max; v_max = v; end
+    end
+    v_max - v_min
 end
 
 """
@@ -135,8 +196,15 @@ Reduce the difference between the maximum and minimum forces in the network.
 From Schek theorem 2. 
 """
 function forceVar(x::AbstractVector{<:Real}, indices::AbstractVector{<:Integer})
-    selected = x[indices]
-    maximum(selected) - minimum(selected)
+    if isempty(indices); return zero(eltype(x)); end
+    v_min = x[indices[1]]
+    v_max = v_min
+    for i in 2:length(indices)
+        v = x[indices[i]]
+        if v < v_min; v_min = v; end
+        if v > v_max; v_max = v; end
+    end
+    v_max - v_min
 end
 
 """
@@ -144,7 +212,11 @@ Minimize the difference between the form found lengths of the edges and the targ
 """
 
 function lenTarget(lengths::AbstractVector{<:Real}, values::AbstractVector{<:Real}, indices::AbstractVector{<:Integer})
-    sum((lengths[indices] .- values).^2)
+    loss = zero(eltype(lengths))
+    for (i, idx) in enumerate(indices)
+        loss += (lengths[idx] - values[i])^2
+    end
+    loss
 end
 
 

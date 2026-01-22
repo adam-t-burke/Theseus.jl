@@ -1,36 +1,54 @@
 using LinearAlgebra
 using Optim
-using Mooncake
+import Mooncake
+import ADTypes
+import DifferentiationInterface
 using Logging
+using TimerOutputs
 
-function evaluate_geometry!(problem::OptimizationProblem{T}, q::AbstractVector{Float64}, anchor_positions::AbstractMatrix{Float64}) where {T}
-    ctx = problem.context
-    nf = length(problem.topology.free_node_indices)
-    
-    # In-place updates
-    update_fixed_positions!(ctx, problem.anchors, anchor_positions)
-    solve_explicit!(ctx, q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, ctx.fixed_positions)
-    
-    # xyz_full assembly
-    ctx.xyz_full[1:nf, :] .= ctx.xyz_free
-    # fixed positions in the global indexing are at the end
-    ctx.xyz_full[nf+1:end, :] .= ctx.fixed_positions
-    
-    # incidence * xyz_full
-    mul!(ctx.member_vectors, problem.topology.incidence, ctx.xyz_full)
-    
-    # member_lengths
-    for i in 1:length(ctx.member_lengths)
-        @inbounds ctx.member_lengths[i] = sqrt(ctx.member_vectors[i,1]^2 + ctx.member_vectors[i,2]^2 + ctx.member_vectors[i,3]^2)
+function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::OptimizationCache)
+    # In-place update of cache buffers
+    solve_FDM!(cache, q, problem, anchor_positions)
+    xyz_full = cache.Nf
+    ne = length(cache.member_lengths)
+    for i in 1:ne
+        s = cache.edge_starts[i]
+        e = cache.edge_ends[i]
+        
+        dx = xyz_full[e, 1] - xyz_full[s, 1]
+        dy = xyz_full[e, 2] - xyz_full[s, 2]
+        dz = xyz_full[e, 3] - xyz_full[s, 3]
+        
+        len = sqrt(dx^2 + dy^2 + dz^2)
+        cache.member_lengths[i] = len
+        cache.member_forces[i] = q[i] * len
     end
+
+    fill!(cache.reactions, 0.0)
+    for i in 1:ne
+        s = cache.edge_starts[i]
+        e = cache.edge_ends[i]
+        qi = q[i]
+        
+        rx = (xyz_full[e, 1] - xyz_full[s, 1]) * qi
+        ry = (xyz_full[e, 2] - xyz_full[s, 2]) * qi
+        rz = (xyz_full[e, 3] - xyz_full[s, 3]) * qi
+        
+        cache.reactions[s, 1] += rx
+        cache.reactions[s, 2] += ry
+        cache.reactions[s, 3] += rz
+        
+        cache.reactions[e, 1] -= rx
+        cache.reactions[e, 2] -= ry
+        cache.reactions[e, 3] -= rz
+    end
+
+    xyz_free = @view xyz_full[problem.topology.free_node_indices, :]
+    xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
     
-    # member_forces
-    ctx.member_forces .= q .* ctx.member_lengths
-    
-    # reactions
-    anchor_reactions!(ctx, problem.topology, q)
-    
-    return GeometrySnapshot(ctx.xyz_free, ctx.fixed_positions, ctx.xyz_full, ctx.member_lengths, ctx.member_forces, ctx.reactions)
+    snapshot = GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, cache.member_lengths, cache.member_forces, cache.reactions)
+    cache.last_snapshot = snapshot
+    return snapshot
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -55,7 +73,11 @@ end
 
 function objective_loss(obj::SumForceLengthObjective, snapshot::GeometrySnapshot)
     edges = obj.edge_indices
-    obj.weight * sum(snapshot.member_lengths[edges] .* snapshot.member_forces[edges])
+    loss = zero(eltype(snapshot.member_lengths))
+    for idx in edges
+        loss += snapshot.member_lengths[idx] * snapshot.member_forces[idx]
+    end
+    obj.weight * loss
 end
 
 function objective_loss(obj::MinLengthObjective, snapshot::GeometrySnapshot)
@@ -88,8 +110,11 @@ end
 
 objective_loss(::AbstractObjective, snapshot::GeometrySnapshot) = zero(eltype(snapshot.member_lengths))
 
-function total_loss(problem::OptimizationProblem{T}, q::AbstractVector{Float64}, anchor_positions::AbstractMatrix{Float64}, snapshot::GeometrySnapshot) where {T}
-    loss = 0.0
+function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, snapshot::GeometrySnapshot)
+    # Note: we use state.cache.to if we have access to it, but total_loss 
+    # doesn't take cache. We could pass it, but for now we'll just sum.
+    # Actually, evaluate_geometry already updated the cache.
+    loss = zero(eltype(snapshot.member_lengths))
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
     end
@@ -125,39 +150,19 @@ function log_trace_info!(trace_state::OptimizationState, q::AbstractVector{Float
     return nothing
 end
 
-struct ObjectiveWrapper{TFact}
-    problem::OptimizationProblem{TFact}
-    trace_state::OptimizationState
-    lb::Vector{Float64}
-    ub::Vector{Float64}
-    lb_idx::Vector{Int64}
-    ub_idx::Vector{Int64}
-    geo_scale::Float64
-    barrier_weight::Float64
-    sharpness::Float64
-end
+function form_finding_objective(problem::OptimizationProblem, cache::OptimizationCache, lb, ub, lb_idx, ub_idx, barrier_weight, sharpness)
+    function objective(θ)
+        q, anchors = unpack_parameters(problem, θ)
+        snapshot = evaluate_geometry(problem, q, anchors, cache)
+        
+        geometric_loss = total_loss(problem, q, anchors, snapshot)
+        barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)
+        
+        loss = geometric_loss + (barrier_loss * barrier_weight)
+        return loss
+    end
 
-function (obj::ObjectiveWrapper{TFact})(θ) where {TFact}
-    q, anchors = unpack_parameters(obj.problem, θ)
-    snapshot = evaluate_geometry!(obj.problem, q, anchors)
-    
-    geometric_loss = total_loss(obj.problem, q, anchors, snapshot)
-    barrier_loss = pBounds(θ, obj.lb, obj.ub, obj.lb_idx, obj.ub_idx, obj.sharpness, obj.sharpness)
-    
-    loss = (geometric_loss * obj.geo_scale) + (barrier_loss * obj.barrier_weight)
-    
-    log_trace_info!(obj.trace_state, q, anchors, geometric_loss, barrier_loss, snapshot)
-    
-    loss
-end
-
-function form_finding_objective(problem::OptimizationProblem{TFact}, trace_state::OptimizationState, lb, ub, lb_idx, ub_idx, geo_scale, barrier_weight, sharpness) where {TFact}
-    empty!(trace_state.loss_trace)
-    empty!(trace_state.penalty_trace)
-    empty!(trace_state.node_trace)
-    trace_state.iterations = 0
-
-    return ObjectiveWrapper{TFact}(problem, trace_state, lb, ub, lb_idx, ub_idx, geo_scale, barrier_weight, sharpness)
+    objective
 end
 
 function parameter_bounds(problem::OptimizationProblem)
@@ -172,28 +177,19 @@ function parameter_bounds(problem::OptimizationProblem)
     lower, upper
 end
 
-function make_gradient(objective, θ0)
-    # Using friendly_tangents=false avoids complex struct recreation Mooncake's "friendly" conversion,
-    # which is likely failing on your objective struct/closure due to captured factorizations 
-    # or Julia 1.12 memory layout changes.
-    cache = Mooncake.prepare_gradient_cache(objective, θ0; friendly_tangents=false)
-    function g!(G, θ)
-        _, grads = Mooncake.value_and_gradient!!(
-            cache, objective, θ; 
-            args_to_zero=(false, true)
-        )
-        # With friendly_tangents=false, the gradient is often a Tangent or MutableTangent.
-        # For a Vector input, it should be obtainable via .fields or directly if it's Bits.
-        if grads[2] isa AbstractVector
-            copyto!(G, grads[2])
-        else
-            copyto!(G, grads[2].fields)
-        end
+function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
+    # Ensure cache is initialized
+    if isnothing(state.cache)
+        state.cache = OptimizationCache(problem)
     end
-    g!
-end
+    reset_timer!(state.cache.to)
 
-function optimize_problem!(problem::OptimizationProblem{T}, state::OptimizationState; on_iteration=nothing) where {T}
+    # Clear traces
+    empty!(state.loss_trace)
+    empty!(state.penalty_trace)
+    empty!(state.node_trace)
+    state.iterations = 0
+
     solver = problem.parameters.solver
     lower_bounds, upper_bounds = parameter_bounds(problem)
     θ0 = pack_parameters(problem, state)
@@ -209,41 +205,61 @@ function optimize_problem!(problem::OptimizationProblem{T}, state::OptimizationS
         @warn "Initial guess is outside bounds" num_lower=sum(initial_violations_lower) num_upper=sum(initial_violations_upper)
     end
 
-    # Auto-scaling
-    geo_scale = 1.0
-    if solver.use_auto_scaling
-        q0, a0 = unpack_parameters(problem, θ0)
-        snap0 = evaluate_geometry!(problem, q0, a0)
-        L0 = total_loss(problem, q0, a0, snap0)
-        geo_scale = 1.0 / max(L0, 1e-6)
-    end
-
-    objective = form_finding_objective(problem, state, lower_bounds, upper_bounds, lb_idx, ub_idx, geo_scale, solver.barrier_weight, solver.barrier_sharpness)
-    gradient! = make_gradient(objective, θ0)
+    objective = form_finding_objective(problem, state.cache, lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_weight, solver.barrier_sharpness)
     
-    outer_iter = Ref(0)
-    callback = function (_opt_state)
-        outer_iter[] += 1
-        state.iterations = outer_iter[]
-        if on_iteration === nothing || isempty(state.loss_trace)
-            return false
+    # Setup Mooncake backend via DifferentiationInterface
+    backend = ADTypes.AutoMooncake(config=Mooncake.Config(friendly_tangents=true))
+    prep = DifferentiationInterface.prepare_gradient(objective, backend, θ0)
+    
+    function fg!(F, G, θ)
+        if G !== nothing
+            val, _ = DifferentiationInterface.value_and_gradient!(objective, G, prep, backend, θ)
+            return val
+        elseif F !== nothing
+            return objective(θ)
         end
-        snapshot = evaluate_geometry!(problem, state.force_densities, state.variable_anchor_positions)
-        loss = state.loss_trace[end]
-        on_iteration(state, snapshot, loss)
+        return nothing
+    end
+    
+    callback = function (os)
+        state.iterations = os.iteration
+        
+        # Unpack current θ
+        # Note: We don't perform a NEW evaluation here because fg!/objective already did it
+        # and stored the result in state.cache.last_snapshot
+        snapshot = state.cache.last_snapshot
+        q = snapshot.member_forces ./ snapshot.member_lengths # approximate q if needed, but better to get from metadata if possible
+        # Actually, let's just use the metadata x if we really need q, anchors for state
+        q_new, anchors_new = unpack_parameters(problem, os.metadata["x"])
+        state.force_densities = q_new
+        state.variable_anchor_positions = anchors_new
+        
+        push!(state.loss_trace, os.value)
+        penalty = pBounds(os.metadata["x"], lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_sharpness, solver.barrier_sharpness)
+        push!(state.penalty_trace, penalty * solver.barrier_weight)
+        
+        if problem.parameters.tracing.record_nodes
+            push!(state.node_trace, copy(snapshot.xyz_full))
+        end
+        
+        if on_iteration !== nothing
+            on_iteration(state, snapshot, os.value)
+        end
         return false
     end
     
     result = Optim.optimize(
-        objective,
-        gradient!,
+        Optim.only_fg!(fg!),
         θ0,
         LBFGS(),
         Optim.Options(
             iterations = solver.max_iterations,
-            f_abstol = solver.absolute_tolerance,
-            f_reltol = solver.relative_tolerance,
+            f_abstol = solver.absolute_tolerance, # Change in objective
+            f_reltol = solver.relative_tolerance, # Relative change in objective
+            g_abstol = solver.absolute_tolerance, # Gradient norm
+            g_tol = solver.relative_tolerance,    # Gradient tolerance (often used as relative)
             callback = callback,
+            extended_trace = true
         ),
     )
 
@@ -251,7 +267,8 @@ function optimize_problem!(problem::OptimizationProblem{T}, state::OptimizationS
     q, anchors = unpack_parameters(problem, min_θ)
     state.force_densities = copy(q)
     state.variable_anchor_positions = copy(anchors)
-    snapshot = evaluate_geometry!(problem, q, anchors)
+    # One last evaluation with the cache to ensure state is consistent and get the final snapshot
+    snapshot = evaluate_geometry(problem, q, anchors, state.cache)
 
     return result, snapshot
 end
