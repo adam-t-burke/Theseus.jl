@@ -130,24 +130,6 @@ function target_xy(xyz::AbstractMatrix{<:Real}, target::AbstractMatrix{<:Real}, 
 end
 
 """
-Find the distance between all pairs of points in a point set. Returns a strictly lower triangular matrix.
-"""
-function pairDist(xyz::AbstractMatrix{<:Real})
-    n = size(xyz, 1)
-    T = eltype(xyz)
-    dist = zeros(T, n, n)
-    for i in 1:n
-        for j in 1:(i-1)
-            dx = xyz[i, 1] - xyz[j, 1]
-            dy = xyz[i, 2] - xyz[j, 2]
-            dz = xyz[i, 3] - xyz[j, 3]
-            dist[i, j] = sqrt(dx^2 + dy^2 + dz^2)
-        end
-    end
-    return dist
-end
-
-"""
 Compare the distance between all pairs of points in a target point set and the distance between all pairs of points in a form found point set.
 """
 function rigidSetCompare(xyz::AbstractMatrix{<:Real}, indices::AbstractVector{<:Integer}, target::AbstractMatrix{<:Real})
@@ -292,68 +274,3 @@ function reaction_direction_magnitude_loss(reactions::AbstractMatrix{<:Real}, ob
     end
     total
 end
-
-
-
-"""
-Cross entropy loss function.
-"""
-function crossEntropyLoss(t::AbstractVector{<:Real}, p::AbstractVector{<:Real})
-    -sum(t .* log1p.(p))
-end
-
-"""
-Weighted cross entropy loss, best used with a plain mask vector of weights.
-"""
-function crossEntropyLoss(t::AbstractVector{<:Real}, p::AbstractVector{<:Real}, w::AbstractVector{<:Real})
-    -vec(t .* log1p.(p))' * w
-end
-
-function crossEntropyLoss(t::AbstractVector{<:Real}, p::AbstractVector{<:Real}, w::SparseVector{T, Ti}) where {T<:Real, Ti<:Integer}
-    -vec(t .* log1p.(p))' * w
-end
-
-"""
-The derivative of the softplus function is the logistic function.
-A scaling parameter k can be introduced to make the inflection point more precise.
-This is a smooth approximation of the heaviside step function. 
-https://en.wikipedia.org/wiki/Logistic_function
-"""
-function logisticFunc(x::Real)
-    one = oneunit(x)
-    one / (one + exp(-x))
-end
-
-function logisticFunc(x::AbstractArray{<:Real})
-    one = oneunit(eltype(x))
-    one ./ (one .+ exp.(-x))
-end
-
-function logisticFunc(x::Real, k::Real)
-    one = oneunit(x)
-    one / (one + exp(-k * x))
-end
-
-function logisticFunc(x::AbstractArray{<:Real}, k::Real)
-    one = oneunit(eltype(x))
-    one ./ (one .+ exp.(-k .* x))
-end
-
-"""
-LogSumExp is the multivariable generalization of the logistic function.
-"""
-function logSumExp(x)
-    log1p(sum(exp.(x)))
-end
-
-"""
-Softmax is a generalized version of the logistic function.
-It returns a vector of probabilities that sum to 1.
-"""
-function softmax(x)
-    exp_x = exp.(x)
-    exp_x ./ sum(exp_x)
-end
-
-softmin(x) = softmax(-x)
-

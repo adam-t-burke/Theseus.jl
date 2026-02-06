@@ -3,7 +3,6 @@ using Optim
 import Mooncake
 import ADTypes
 import DifferentiationInterface
-using Logging
 using TimerOutputs
 
 function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::OptimizationCache)

@@ -1,5 +1,4 @@
 import HTTP.WebSockets
-using Logging
 
 cancel = false
 simulating = false

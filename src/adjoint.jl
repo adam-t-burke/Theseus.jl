@@ -3,7 +3,6 @@ module Adjoints
 using ..Theseus
 using LinearAlgebra
 using SparseArrays
-using LinearSolve
 using Mooncake
 using TimerOutputs
 using Mooncake: NoTangent, @is_primitive, ReverseMode, DefaultCtx, CoDual, NoRData, NoFData
