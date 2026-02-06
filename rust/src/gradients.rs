@@ -18,15 +18,15 @@ use ndarray::Array2;
 
 /// Solve A λ = dJ/dx̂ for each coordinate column.
 ///
-/// Since A is symmetric (A = Aᵀ), we reuse the **same** LDL factorisation
-/// that was computed during the forward solve — no refactoring needed.
+/// Since A is symmetric (A = Aᵀ), we reuse the **same** factorization
+/// (Cholesky or LDL) from the forward solve — no refactoring needed.
 pub fn solve_adjoint(cache: &mut FdmCache) {
     let n = cache.a_matrix.cols();
 
     for d in 0..3 {
         let rhs: Vec<f64> = (0..n).map(|i| cache.grad_x[[i, d]]).collect();
-        let x = cache.ldl.as_ref()
-            .expect("LDL factorization must exist before adjoint solve")
+        let x = cache.factorization.as_ref()
+            .expect("Factorization must exist before adjoint solve")
             .solve(&rhs);
         for i in 0..n {
             cache.lambda[[i, d]] = x[i];

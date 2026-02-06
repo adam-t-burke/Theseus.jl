@@ -2,10 +2,9 @@
 //!
 //! Mirrors `src/FDM.jl` from the Julia code.
 
-use crate::types::{FdmCache, Problem};
+use crate::types::{FdmCache, Factorization, Problem};
 use ndarray::Array2;
 use sprs::CsMat;
-use sprs_ldl::LdlNumeric;
 
 // ─────────────────────────────────────────────────────────────
 //  Fixed-node position assembly
@@ -104,10 +103,11 @@ pub fn assemble_rhs(cache: &mut FdmCache, problem: &Problem) {
 //  Linear solve  (dense fallback — will be replaced with LDL)
 // ─────────────────────────────────────────────────────────────
 
-/// Factor A via sparse LDL^T and solve A x = rhs for all 3 coordinate columns.
+/// Factor A via sparse Cholesky or LDL^T and solve A x = rhs for all 3 columns.
 ///
-/// On first call, performs a fresh factorization. On subsequent calls, reuses
-/// the symbolic structure via `LdlNumeric::update()` — only numeric values change.
+/// On first call, performs a fresh factorization (symbolic + numeric).
+/// On subsequent calls, reuses the symbolic structure via `Factorization::update()`
+/// — only numeric values change.
 pub fn factor_and_solve(cache: &mut FdmCache, perturbation: f64) {
     // Add diagonal perturbation if requested
     if perturbation > 0.0 {
@@ -124,29 +124,27 @@ pub fn factor_and_solve(cache: &mut FdmCache, perturbation: f64) {
         }
     }
 
-    // Factor or re-factor
+    // Factor or re-factor using the adaptive strategy
     let a_view = cache.a_matrix.view();
-    match &mut cache.ldl {
-        Some(ldl) => {
-            // Same sparsity pattern — numeric-only refactor
-            ldl.update(a_view)
-                .expect("LDL numeric update failed (singular matrix?)");
+    match &mut cache.factorization {
+        Some(fac) => {
+            fac.update(a_view)
+                .expect("Numeric re-factor failed (singular matrix?)");
         }
         None => {
-            // First call — full symbolic + numeric
-            cache.ldl = Some(
-                LdlNumeric::new(a_view)
-                    .expect("LDL initial factorization failed")
+            cache.factorization = Some(
+                Factorization::new(a_view, cache.strategy)
+                    .expect("Initial factorization failed")
             );
         }
     }
 
     // Solve for each coordinate column
-    let ldl = cache.ldl.as_ref().unwrap();
+    let fac = cache.factorization.as_ref().unwrap();
     let n = cache.a_matrix.cols();
     for d in 0..3 {
         let rhs: Vec<f64> = (0..n).map(|i| cache.rhs[[i, d]]).collect();
-        let x = ldl.solve(&rhs);
+        let x = fac.solve(&rhs);
         for i in 0..n {
             cache.x[[i, d]] = x[i];
         }

@@ -1,6 +1,6 @@
 use ndarray::Array2;
-use sprs::CsMat;
-use sprs_ldl::LdlNumeric;
+use sprs::{CsMat, FillInReduction, SymmetryCheck};
+use sprs_ldl::{Ldl, LdlNumeric};
 
 // ─────────────────────────────────────────────────────────────
 //  Constants
@@ -204,10 +204,11 @@ pub struct QToNz {
 // ─────────────────────────────────────────────────────────────
 
 /// Adaptive factorisation for A(q) = Cn^T diag(q) Cn.
-/// Use Cholesky when bounds guarantee sign-definiteness; LDL otherwise.
+/// Cholesky when bounds guarantee sign-definiteness; LDL for mixed sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactorisationStrategy {
     /// All q_k > 0  (or all < 0):  A is SPD → Cholesky.
+    /// Uses AMD fill-in reduction for better sparsity in L.
     Cholesky,
     /// Mixed sign q allowed:  A is symmetric indefinite → LDL.
     LDL,
@@ -226,6 +227,99 @@ impl FactorisationStrategy {
     }
 }
 
+/// Holds a numeric LDL^T (or Cholesky) factorization.
+///
+/// Both variants use `sprs-ldl`'s `LdlNumeric` internally.
+/// The Cholesky path uses AMD fill-in reduction and validates D > 0.
+/// The LDL path allows indefinite D.
+pub enum Factorization {
+    /// SPD path: AMD-ordered, D > 0 validated
+    Cholesky(LdlNumeric<f64, usize>),
+    /// Indefinite path: no sign constraint on D
+    Ldl(LdlNumeric<f64, usize>),
+}
+
+impl std::fmt::Debug for Factorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cholesky(_) => write!(f, "Factorization::Cholesky(...)"),
+            Self::Ldl(_) => write!(f, "Factorization::Ldl(...)"),
+        }
+    }
+}
+
+impl Factorization {
+    /// Create an initial factorization from A and the chosen strategy.
+    pub fn new(a: sprs::CsMatView<f64>, strategy: FactorisationStrategy) -> Result<Self, sprs::errors::LinalgError> {
+        match strategy {
+            FactorisationStrategy::Cholesky => {
+                let ldl = Ldl::new()
+                    .fill_in_reduction(FillInReduction::ReverseCuthillMcKee)
+                    .check_symmetry(SymmetryCheck::DontCheckSymmetry)
+                    .numeric(a)?;
+                // Validate positive-definiteness: all diagonal D entries > 0
+                for (i, &di) in ldl.d().iter().enumerate() {
+                    if di <= 0.0 {
+                        return Err(sprs::errors::LinalgError::SingularMatrix(
+                            sprs::errors::SingularMatrixInfo {
+                                index: i,
+                                reason: "D <= 0 in Cholesky factorization (not SPD)",
+                            },
+                        ));
+                    }
+                }
+                Ok(Self::Cholesky(ldl))
+            }
+            FactorisationStrategy::LDL => {
+                let ldl = Ldl::new()
+                    .fill_in_reduction(FillInReduction::ReverseCuthillMcKee)
+                    .check_symmetry(SymmetryCheck::DontCheckSymmetry)
+                    .numeric(a)?;
+                Ok(Self::Ldl(ldl))
+            }
+        }
+    }
+
+    /// Re-factor with updated numeric values (same sparsity pattern).
+    pub fn update(&mut self, a: sprs::CsMatView<f64>) -> Result<(), sprs::errors::LinalgError> {
+        match self {
+            Self::Cholesky(ldl) => {
+                ldl.update(a)?;
+                for (i, &di) in ldl.d().iter().enumerate() {
+                    if di <= 0.0 {
+                        return Err(sprs::errors::LinalgError::SingularMatrix(
+                            sprs::errors::SingularMatrixInfo {
+                                index: i,
+                                reason: "D <= 0 in Cholesky re-factor (not SPD)",
+                            },
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Ldl(ldl) => {
+                ldl.update(a)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Solve A x = rhs using the stored factorization.
+    pub fn solve(&self, rhs: &[f64]) -> Vec<f64> {
+        match self {
+            Self::Cholesky(ldl) | Self::Ldl(ldl) => ldl.solve(rhs),
+        }
+    }
+
+    /// The strategy this factorization was built with.
+    pub fn strategy(&self) -> FactorisationStrategy {
+        match self {
+            Self::Cholesky(_) => FactorisationStrategy::Cholesky,
+            Self::Ldl(_) => FactorisationStrategy::LDL,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  Pre-allocated solver cache
 // ─────────────────────────────────────────────────────────────
@@ -239,9 +333,9 @@ pub struct FdmCache {
     /// Sparsity pattern is fixed; values are updated in-place each iteration.
     pub a_matrix: CsMat<f64>,
 
-    /// Numeric LDL^T factorization — reuses the same sparsity pattern
-    /// via `.update()` instead of re-doing symbolic analysis.
-    pub ldl: Option<LdlNumeric<f64, usize>>,
+    /// Numeric factorization — Cholesky (SPD) or LDL (indefinite).
+    /// Created on first factor, reused via `.update()` thereafter.
+    pub factorization: Option<Factorization>,
 
     pub q_to_nz: QToNz,
 
@@ -368,7 +462,7 @@ impl FdmCache {
 
         FdmCache {
             a_matrix,
-            ldl: None,
+            factorization: None,
             q_to_nz: QToNz { entries: q_to_nz_entries },
             edge_starts,
             edge_ends,
