@@ -92,10 +92,12 @@ pub enum Objective {
     LengthVariation {
         weight: f64,
         edge_indices: Vec<usize>,
+        sharpness: f64,
     },
     ForceVariation {
         weight: f64,
         edge_indices: Vec<usize>,
+        sharpness: f64,
     },
     SumForceLength {
         weight: f64,

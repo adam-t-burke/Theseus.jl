@@ -102,11 +102,11 @@ pub fn accumulate_explicit_gradients(
             Objective::TargetLength { weight, edge_indices, target } => {
                 grad_target_length(cache, *weight, edge_indices, target);
             }
-            Objective::LengthVariation { weight, edge_indices } => {
-                grad_length_variation(cache, *weight, edge_indices);
+            Objective::LengthVariation { weight, edge_indices, sharpness } => {
+                grad_length_variation(cache, *weight, edge_indices, *sharpness);
             }
-            Objective::ForceVariation { weight, edge_indices } => {
-                grad_force_variation(cache, *weight, edge_indices);
+            Objective::ForceVariation { weight, edge_indices, sharpness } => {
+                grad_force_variation(cache, *weight, edge_indices, *sharpness);
             }
             Objective::SumForceLength { weight, edge_indices } => {
                 grad_sum_force_length(cache, *weight, edge_indices);
@@ -211,51 +211,55 @@ fn grad_target_length(
     }
 }
 
-/// LengthVariation:  L = w (max(ℓ) − min(ℓ))
-/// Gradient is non-smooth (subgradient): only the argmax / argmin edges get signal.
+/// Softmax weights: w_i = exp(β(v_i − m)) / Σ exp(β(v_j − m))
+/// Returns one weight per edge in `edge_indices`.
+fn softmax_weights(values: &[f64], edge_indices: &[usize], beta: f64) -> Vec<f64> {
+    let m = edge_indices.iter().map(|&i| values[i]).fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = edge_indices.iter().map(|&i| ((values[i] - m) * beta).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    exps.into_iter().map(|e| e / sum).collect()
+}
+
+/// LengthVariation:  L = w (smooth_max(ℓ) − smooth_min(ℓ))
+///   dL/dℓ_i = w (softmax_i(β ℓ) − softmax_i(−β ℓ))
+/// Then chain through ℓ → x̂.
 fn grad_length_variation(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
+    beta: f64,
 ) {
     if edge_indices.is_empty() { return; }
-    let mut min_idx = edge_indices[0];
-    let mut max_idx = edge_indices[0];
-    let mut min_val = cache.member_lengths[min_idx];
-    let mut max_val = min_val;
-    for &idx in &edge_indices[1..] {
-        let v = cache.member_lengths[idx];
-        if v < min_val { min_val = v; min_idx = idx; }
-        if v > max_val { max_val = v; max_idx = idx; }
-    }
 
-    // dL/dℓ_max = +w,  dL/dℓ_min = −w
-    // Chain through ℓ → x̂
-    add_length_grad_to_x(cache, max_idx, weight);
-    add_length_grad_to_x(cache, min_idx, -weight);
+    // softmax for smooth_max  (positive β)
+    let w_max = softmax_weights(&cache.member_lengths, edge_indices, beta);
+    // softmax for smooth_min = −smooth_max(−v):  d(smooth_min)/dv_i = softmax_i(−β v)
+    let w_min = softmax_weights(&cache.member_lengths, edge_indices, -beta);
+
+    for (j, &k) in edge_indices.iter().enumerate() {
+        let dl_dl = weight * (w_max[j] - w_min[j]);
+        add_length_grad_to_x(cache, k, dl_dl);
+    }
 }
 
-/// ForceVariation:  L = w (max(f) − min(f))
+/// ForceVariation:  L = w (smooth_max(f) − smooth_min(f))
+///   dL/df_i = w (softmax_i(β f) − softmax_i(−β f))
+/// Then chain through f → (x̂, q).
 fn grad_force_variation(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
+    beta: f64,
 ) {
     if edge_indices.is_empty() { return; }
-    let mut min_idx = edge_indices[0];
-    let mut max_idx = edge_indices[0];
-    let mut min_val = cache.member_forces[min_idx];
-    let mut max_val = min_val;
-    for &idx in &edge_indices[1..] {
-        let v = cache.member_forces[idx];
-        if v < min_val { min_val = v; min_idx = idx; }
-        if v > max_val { max_val = v; max_idx = idx; }
-    }
 
-    // dL/df_max = +w,  dL/df_min = −w
-    // f_k = q_k ℓ_k  →  df/dx̂ = q_k dℓ/dx̂,  df/dq_k = ℓ_k
-    add_force_grad(cache, max_idx, weight);
-    add_force_grad(cache, min_idx, -weight);
+    let w_max = softmax_weights(&cache.member_forces, edge_indices, beta);
+    let w_min = softmax_weights(&cache.member_forces, edge_indices, -beta);
+
+    for (j, &k) in edge_indices.iter().enumerate() {
+        let dl_df = weight * (w_max[j] - w_min[j]);
+        add_force_grad(cache, k, dl_df);
+    }
 }
 
 /// SumForceLength:  L = w Σ ℓ_k · f_k = w Σ q_k ℓ_k²

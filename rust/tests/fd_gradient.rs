@@ -546,6 +546,164 @@ fn fd_ldl_combined() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Tests:  Variation objectives  (smooth log-sum-exp)
+// ─────────────────────────────────────────────────────────────
+
+/// LengthVariation — Cholesky path.
+#[test]
+fn fd_cholesky_length_variation() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![0.1; ne],
+        upper: vec![50.0; ne],
+    };
+
+    let objectives = vec![Objective::LengthVariation {
+        weight: 1.0,
+        edge_indices: (0..ne).collect(),
+        sharpness: 20.0,
+    }];
+
+    let problem = make_arch_problem(bounds, objectives);
+    assert_eq!(
+        FactorisationStrategy::from_bounds(&problem.bounds),
+        FactorisationStrategy::Cholesky,
+    );
+
+    let theta: Vec<f64> = vec![1.0, 2.0, 1.5, 2.5, 3.0, 1.2, 2.0, 1.8];
+
+    fd_gradient_check(&problem, &theta, 1e-6, 1e-4, 1e-3);
+}
+
+/// ForceVariation — Cholesky path.
+#[test]
+fn fd_cholesky_force_variation() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![0.1; ne],
+        upper: vec![50.0; ne],
+    };
+
+    let objectives = vec![Objective::ForceVariation {
+        weight: 1.0,
+        edge_indices: (0..ne).collect(),
+        sharpness: 20.0,
+    }];
+
+    let problem = make_arch_problem(bounds, objectives);
+    assert_eq!(
+        FactorisationStrategy::from_bounds(&problem.bounds),
+        FactorisationStrategy::Cholesky,
+    );
+
+    let theta: Vec<f64> = vec![2.0, 3.0, 1.5, 2.5, 1.0, 3.5, 2.0, 1.8];
+
+    fd_gradient_check(&problem, &theta, 1e-6, 1e-4, 1e-3);
+}
+
+/// LengthVariation — LDL path (mixed bounds).
+#[test]
+fn fd_ldl_length_variation() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![-10.0; ne],
+        upper: vec![10.0; ne],
+    };
+
+    let objectives = vec![Objective::LengthVariation {
+        weight: 1.0,
+        edge_indices: (0..ne).collect(),
+        sharpness: 20.0,
+    }];
+
+    let problem = make_arch_problem(bounds, objectives);
+    assert_eq!(
+        FactorisationStrategy::from_bounds(&problem.bounds),
+        FactorisationStrategy::LDL,
+    );
+
+    let theta: Vec<f64> = vec![1.0, 2.0, 1.5, 2.5, 3.0, 1.2, 2.0, 1.8];
+
+    fd_gradient_check(&problem, &theta, 1e-6, 1e-4, 1e-3);
+}
+
+/// ForceVariation — LDL path (mixed bounds).
+#[test]
+fn fd_ldl_force_variation() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![-10.0; ne],
+        upper: vec![10.0; ne],
+    };
+
+    let objectives = vec![Objective::ForceVariation {
+        weight: 1.0,
+        edge_indices: (0..ne).collect(),
+        sharpness: 20.0,
+    }];
+
+    let problem = make_arch_problem(bounds, objectives);
+    assert_eq!(
+        FactorisationStrategy::from_bounds(&problem.bounds),
+        FactorisationStrategy::LDL,
+    );
+
+    let theta: Vec<f64> = vec![2.0, 1.5, 3.0, 2.5, 1.0, 4.0, 2.0, 1.5];
+
+    fd_gradient_check(&problem, &theta, 1e-6, 1e-4, 1e-3);
+}
+
+/// Combined with variation objectives — Cholesky path.
+#[test]
+fn fd_cholesky_combined_with_variation() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![0.1; ne],
+        upper: vec![20.0; ne],
+    };
+
+    let target_xyz = Array2::from_shape_vec(
+        (5, 3),
+        vec![
+            1.0, 0.0, 0.8,
+            2.0, 0.0, 1.5,
+            3.0, 0.0, 2.0,
+            4.0, 0.0, 1.5,
+            5.0, 0.0, 0.8,
+        ],
+    )
+    .unwrap();
+
+    let objectives = vec![
+        Objective::TargetXYZ {
+            weight: 1.0,
+            node_indices: vec![1, 2, 3, 4, 5],
+            target: target_xyz,
+        },
+        Objective::LengthVariation {
+            weight: 0.5,
+            edge_indices: (0..ne).collect(),
+            sharpness: 20.0,
+        },
+        Objective::ForceVariation {
+            weight: 0.3,
+            edge_indices: vec![0, 1, 2, 3, 4, 5],
+            sharpness: 15.0,
+        },
+    ];
+
+    let problem = make_arch_problem(bounds, objectives);
+    assert_eq!(
+        FactorisationStrategy::from_bounds(&problem.bounds),
+        FactorisationStrategy::Cholesky,
+    );
+
+    let theta: Vec<f64> = vec![1.5, 2.0, 2.5, 3.0, 1.0, 1.5, 2.2, 1.8];
+
+    fd_gradient_check(&problem, &theta, 1e-6, 1e-4, 1e-3);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Cross-validation: both strategies give same value at same θ
 // ─────────────────────────────────────────────────────────────
 

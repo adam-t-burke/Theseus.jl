@@ -120,34 +120,37 @@ fn target_length_loss(lengths: &[f64], edge_indices: &[usize], target: &[f64]) -
     loss
 }
 
-/// LengthVariation:  max(ℓ) − min(ℓ)  over selected edges.
-fn length_variation_loss(lengths: &[f64], edge_indices: &[usize]) -> f64 {
-    if edge_indices.is_empty() {
-        return 0.0;
-    }
-    let mut v_min = lengths[edge_indices[0]];
-    let mut v_max = v_min;
-    for &idx in &edge_indices[1..] {
-        let v = lengths[idx];
-        if v < v_min { v_min = v; }
-        if v > v_max { v_max = v; }
-    }
-    v_max - v_min
+/// Numerically stable log-sum-exp smooth maximum:
+///   smooth_max_β(v) = m + (1/β) ln Σ exp(β(v_i − m)),  m = max(v)
+/// As β → ∞ this converges to the true max.
+fn smooth_max(values: &[f64], indices: &[usize], beta: f64) -> f64 {
+    let m = indices.iter().map(|&i| values[i]).fold(f64::NEG_INFINITY, f64::max);
+    let sum: f64 = indices.iter().map(|&i| ((values[i] - m) * beta).exp()).sum();
+    m + sum.ln() / beta
 }
 
-/// ForceVariation:  max(f) − min(f)  over selected edges.
-fn force_variation_loss(forces: &[f64], edge_indices: &[usize]) -> f64 {
+/// Numerically stable log-sum-exp smooth minimum:
+///   smooth_min_β(v) = −smooth_max_β(−v)
+fn smooth_min(values: &[f64], indices: &[usize], beta: f64) -> f64 {
+    let m = indices.iter().map(|&i| values[i]).fold(f64::INFINITY, f64::min);
+    let sum: f64 = indices.iter().map(|&i| ((m - values[i]) * beta).exp()).sum();
+    m - sum.ln() / beta
+}
+
+/// LengthVariation:  smooth_max(ℓ) − smooth_min(ℓ)  over selected edges.
+fn length_variation_loss(lengths: &[f64], edge_indices: &[usize], beta: f64) -> f64 {
     if edge_indices.is_empty() {
         return 0.0;
     }
-    let mut v_min = forces[edge_indices[0]];
-    let mut v_max = v_min;
-    for &idx in &edge_indices[1..] {
-        let v = forces[idx];
-        if v < v_min { v_min = v; }
-        if v > v_max { v_max = v; }
+    smooth_max(lengths, edge_indices, beta) - smooth_min(lengths, edge_indices, beta)
+}
+
+/// ForceVariation:  smooth_max(f) − smooth_min(f)  over selected edges.
+fn force_variation_loss(forces: &[f64], edge_indices: &[usize], beta: f64) -> f64 {
+    if edge_indices.is_empty() {
+        return 0.0;
     }
-    v_max - v_min
+    smooth_max(forces, edge_indices, beta) - smooth_min(forces, edge_indices, beta)
 }
 
 /// SumForceLength:  Σ_i ℓ_i · f_i  =  Σ_i q_i · ℓ_i²
@@ -270,11 +273,11 @@ pub fn objective_loss(obj: &Objective, snap: &GeometrySnapshot) -> f64 {
         Objective::TargetLength { weight, edge_indices, target } => {
             weight * target_length_loss(snap.member_lengths, edge_indices, target)
         }
-        Objective::LengthVariation { weight, edge_indices } => {
-            weight * length_variation_loss(snap.member_lengths, edge_indices)
+        Objective::LengthVariation { weight, edge_indices, sharpness } => {
+            weight * length_variation_loss(snap.member_lengths, edge_indices, *sharpness)
         }
-        Objective::ForceVariation { weight, edge_indices } => {
-            weight * force_variation_loss(snap.member_forces, edge_indices)
+        Objective::ForceVariation { weight, edge_indices, sharpness } => {
+            weight * force_variation_loss(snap.member_forces, edge_indices, *sharpness)
         }
         Objective::SumForceLength { weight, edge_indices } => {
             weight * sum_force_length_loss(snap.member_lengths, snap.member_forces, edge_indices)
