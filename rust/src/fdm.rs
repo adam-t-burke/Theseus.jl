@@ -5,6 +5,7 @@
 use crate::types::{FdmCache, Problem};
 use ndarray::Array2;
 use sprs::CsMat;
+use sprs_ldl::LdlNumeric;
 
 // ─────────────────────────────────────────────────────────────
 //  Fixed-node position assembly
@@ -44,14 +45,15 @@ pub fn update_fixed_positions(cache: &mut FdmCache, problem: &Problem, anchor_po
 //  System matrix assembly  A(q)
 // ─────────────────────────────────────────────────────────────
 
-/// Zero-allocation in-place update of `cache.a_data` from current q values.
+/// Zero-allocation in-place update of A's values from current q.
 /// A = Cn^T diag(q) Cn  via the precomputed `q_to_nz` mapping.
 pub fn assemble_a(cache: &mut FdmCache) {
-    cache.a_data.fill(0.0);
+    let data = cache.a_matrix.data_mut();
+    data.fill(0.0);
     for (k, entries) in cache.q_to_nz.entries.iter().enumerate() {
         let qk = cache.q[k];
         for &(nz_idx, coeff) in entries {
-            cache.a_data[nz_idx] += qk * coeff;
+            data[nz_idx] += qk * coeff;
         }
     }
 }
@@ -102,100 +104,53 @@ pub fn assemble_rhs(cache: &mut FdmCache, problem: &Problem) {
 //  Linear solve  (dense fallback — will be replaced with LDL)
 // ─────────────────────────────────────────────────────────────
 
-/// Solve A x = rhs using a dense LDL/Cholesky factorisation.
+/// Factor A via sparse LDL^T and solve A x = rhs for all 3 coordinate columns.
 ///
-/// This is a temporary implementation that converts A to dense.
-/// Once `sprs-ldl` or `cholmod` bindings are integrated, this will
-/// use the sparse factorisation directly.
-pub fn solve_linear_system(cache: &mut FdmCache, perturbation: f64) {
-    let n = cache.a_dim;
-
-    // Reconstruct dense A from CSC
-    let mut a_dense = Array2::<f64>::zeros((n, n));
-    for col in 0..n {
-        let start = cache.a_indptr[col];
-        let end_ = cache.a_indptr[col + 1];
-        for nz in start..end_ {
-            let row = cache.a_indices[nz];
-            a_dense[[row, col]] = cache.a_data[nz];
-        }
-    }
-
-    // Add perturbation to diagonal if requested
+/// On first call, performs a fresh factorization. On subsequent calls, reuses
+/// the symbolic structure via `LdlNumeric::update()` — only numeric values change.
+pub fn factor_and_solve(cache: &mut FdmCache, perturbation: f64) {
+    // Add diagonal perturbation if requested
     if perturbation > 0.0 {
-        for i in 0..n {
-            a_dense[[i, i]] += perturbation;
+        let n = cache.a_matrix.cols();
+        // Collect diagonal nz indices first to satisfy borrow checker
+        let diag_indices: Vec<usize> = (0..n).filter_map(|col| {
+            let start = cache.a_matrix.indptr().raw_storage()[col];
+            let end = cache.a_matrix.indptr().raw_storage()[col + 1];
+            (start..end).find(|&nz| cache.a_matrix.indices()[nz] == col)
+        }).collect();
+        let data = cache.a_matrix.data_mut();
+        for nz in diag_indices {
+            data[nz] += perturbation;
         }
     }
 
-    // Solve via dense LDL (Bunch-Kaufman-like pivot)
-    // For now, use a straightforward Gaussian elimination with partial pivoting.
-    // TODO: Replace with sprs-ldl sparse factorisation
+    // Factor or re-factor
+    let a_view = cache.a_matrix.view();
+    match &mut cache.ldl {
+        Some(ldl) => {
+            // Same sparsity pattern — numeric-only refactor
+            ldl.update(a_view)
+                .expect("LDL numeric update failed (singular matrix?)");
+        }
+        None => {
+            // First call — full symbolic + numeric
+            cache.ldl = Some(
+                LdlNumeric::new(a_view)
+                    .expect("LDL initial factorization failed")
+            );
+        }
+    }
+
+    // Solve for each coordinate column
+    let ldl = cache.ldl.as_ref().unwrap();
+    let n = cache.a_matrix.cols();
     for d in 0..3 {
-        let mut b: Vec<f64> = (0..n).map(|i| cache.rhs[[i, d]]).collect();
-        let x = dense_solve(&a_dense, &mut b);
+        let rhs: Vec<f64> = (0..n).map(|i| cache.rhs[[i, d]]).collect();
+        let x = ldl.solve(&rhs);
         for i in 0..n {
             cache.x[[i, d]] = x[i];
         }
     }
-}
-
-/// Simple dense symmetric solve via LDLT factorisation (diagonal pivoting).
-/// Operates on a copy to preserve the original.
-pub fn dense_solve(a: &Array2<f64>, b: &mut [f64]) -> Vec<f64> {
-    let n = b.len();
-    // Copy A and b for Gaussian elimination
-    let mut m = a.clone();
-    let mut x = b.to_vec();
-
-    // Gaussian elimination with partial pivoting
-    for col in 0..n {
-        // Find pivot
-        let mut max_row = col;
-        let mut max_val = m[[col, col]].abs();
-        for row in (col + 1)..n {
-            let v = m[[row, col]].abs();
-            if v > max_val {
-                max_val = v;
-                max_row = row;
-            }
-        }
-
-        // Swap rows
-        if max_row != col {
-            for j in 0..n {
-                let tmp = m[[col, j]];
-                m[[col, j]] = m[[max_row, j]];
-                m[[max_row, j]] = tmp;
-            }
-            x.swap(col, max_row);
-        }
-
-        let pivot = m[[col, col]];
-        if pivot.abs() < 1e-30 {
-            // Singular — return zeros
-            return vec![0.0; n];
-        }
-
-        // Eliminate below
-        for row in (col + 1)..n {
-            let factor = m[[row, col]] / pivot;
-            for j in col..n {
-                m[[row, j]] -= factor * m[[col, j]];
-            }
-            x[row] -= factor * x[col];
-        }
-    }
-
-    // Back substitution
-    for col in (0..n).rev() {
-        for row in (col + 1)..n {
-            x[col] -= m[[col, row]] * x[row];
-        }
-        x[col] /= m[[col, col]];
-    }
-
-    x
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -223,8 +178,8 @@ pub fn solve_fdm(
     // 3. Assemble RHS
     assemble_rhs(cache, problem);
 
-    // 4. Solve A x = rhs
-    solve_linear_system(cache, perturbation);
+    // 4. Factor A and solve A x = rhs
+    factor_and_solve(cache, perturbation);
 
     // 5. Write free-node positions back to Nf
     for (i, &node) in problem.topology.free_node_indices.iter().enumerate() {

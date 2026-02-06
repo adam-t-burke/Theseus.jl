@@ -1,5 +1,6 @@
 use ndarray::Array2;
 use sprs::CsMat;
+use sprs_ldl::LdlNumeric;
 
 // ─────────────────────────────────────────────────────────────
 //  Constants
@@ -234,11 +235,13 @@ impl FactorisationStrategy {
 #[derive(Debug)]
 pub struct FdmCache {
     // ── Sparse system ──────────────────────────────────────
-    /// System matrix  A = Cn^T diag(q) Cn   (CSC, nn_free × nn_free)
-    pub a_data: Vec<f64>,     // mutable nzval – same sparsity pattern as template
-    pub a_indptr: Vec<usize>, // column pointers (immutable after init)
-    pub a_indices: Vec<usize>, // row indices (immutable after init)
-    pub a_dim: usize,         // nn_free
+    /// System matrix A = Cn^T diag(q) Cn  (CSC, nn_free × nn_free).
+    /// Sparsity pattern is fixed; values are updated in-place each iteration.
+    pub a_matrix: CsMat<f64>,
+
+    /// Numeric LDL^T factorization — reuses the same sparsity pattern
+    /// via `.update()` instead of re-doing symbolic analysis.
+    pub ldl: Option<LdlNumeric<f64, usize>>,
 
     pub q_to_nz: QToNz,
 
@@ -299,16 +302,11 @@ impl FdmCache {
         let cn_t = cn.transpose_view().to_csc();
         // Symbolic Cn^T * Cn to get the pattern
         let a_template = &cn_t * cn;
-        let a_csc = a_template.to_csc();
-        let a_dim = nn_free;
-        let a_indptr: Vec<usize> = a_csc.indptr().into_raw_storage().to_vec();
-        let a_indices: Vec<usize> = a_csc.indices().to_vec();
-        let nnz = a_indices.len();
-        let a_data = vec![0.0f64; nnz];
+        let a_matrix = a_template.to_csc();
 
         // ── 2. Build q_to_nz mapping ──────────────────────
         // For each edge k, find which free nodes it touches in Cn,
-        // then map those (n1, n2) pairs to indices in a_data.
+        // then map those (n1, n2) pairs to indices in a_matrix.data().
         let mut edge_to_free_nodes: Vec<Vec<(usize, f64)>> = vec![Vec::new(); ne];
         // Iterate columns of Cn (CSC: each column = a free node)
         let cn_csc = cn.to_csc();
@@ -328,7 +326,8 @@ impl FdmCache {
             for &(n1, v1) in nodes {
                 for &(n2, v2) in nodes {
                     // Find nz index of (n1, n2) in CSC  [row=n1, col=n2]
-                    let nz_idx = find_nz_index(&a_indptr, &a_indices, n1, n2)
+                    let indptr = a_matrix.indptr();
+                    let nz_idx = find_nz_index(indptr.raw_storage(), a_matrix.indices(), n1, n2)
                         .expect("Sparsity pattern mismatch in q_to_nz");
                     q_to_nz_entries[k].push((nz_idx, v1 * v2));
                 }
@@ -368,10 +367,8 @@ impl FdmCache {
         let cn_owned = cn.clone();
 
         FdmCache {
-            a_data,
-            a_indptr,
-            a_indices,
-            a_dim,
+            a_matrix,
+            ldl: None,
             q_to_nz: QToNz { entries: q_to_nz_entries },
             edge_starts,
             edge_ends,

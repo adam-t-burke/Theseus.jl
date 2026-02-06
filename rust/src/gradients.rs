@@ -13,28 +13,21 @@ use crate::types::{FdmCache, GeometrySnapshot, Objective, Problem};
 use ndarray::Array2;
 
 // ─────────────────────────────────────────────────────────────
-//  Adjoint solve  (reuse forward factorisation)
+//  Adjoint solve  (reuses LDL factorisation from forward solve)
 // ─────────────────────────────────────────────────────────────
 
-/// Solve A^T λ = dJ/dx.  Since A is symmetric, this is the same system.
-/// Uses the same dense fallback as the forward solve (for now).
+/// Solve A λ = dJ/dx̂ for each coordinate column.
+///
+/// Since A is symmetric (A = Aᵀ), we reuse the **same** LDL factorisation
+/// that was computed during the forward solve — no refactoring needed.
 pub fn solve_adjoint(cache: &mut FdmCache) {
-    // We need to solve  A λ = grad_x  for each of the 3 coordinate columns.
-    // Reconstruct dense A (same as forward solve)
-    let n = cache.a_dim;
-    let mut a_dense = Array2::<f64>::zeros((n, n));
-    for col in 0..n {
-        let start = cache.a_indptr[col];
-        let end_ = cache.a_indptr[col + 1];
-        for nz in start..end_ {
-            let row = cache.a_indices[nz];
-            a_dense[[row, col]] = cache.a_data[nz];
-        }
-    }
+    let n = cache.a_matrix.cols();
 
     for d in 0..3 {
-        let mut b: Vec<f64> = (0..n).map(|i| cache.grad_x[[i, d]]).collect();
-        let x = crate::fdm::dense_solve(&a_dense, &mut b);
+        let rhs: Vec<f64> = (0..n).map(|i| cache.grad_x[[i, d]]).collect();
+        let x = cache.ldl.as_ref()
+            .expect("LDL factorization must exist before adjoint solve")
+            .solve(&rhs);
         for i in 0..n {
             cache.lambda[[i, d]] = x[i];
         }
