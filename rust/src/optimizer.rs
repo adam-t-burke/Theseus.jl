@@ -1,0 +1,204 @@
+//! L-BFGS optimisation driver via the `argmin` crate.
+//!
+//! Wraps the hand-coded `value_and_gradient` into argmin's `CostFunction`
+//! + `Gradient` traits, then runs L-BFGS with the user's solver options.
+//!
+//! Uses `Vec<f64>` as the argmin parameter type to avoid ndarray version
+//! conflicts between our ndarray 0.16 and argmin-math's bundled ndarray.
+
+use crate::gradients::value_and_gradient;
+use crate::types::{FdmCache, Problem, SolverResult, OptimizationState};
+use argmin::core::{CostFunction, Gradient, Executor, State, TerminationReason};
+use argmin::solver::linesearch::MoreThuenteLineSearch;
+use argmin::solver::quasinewton::LBFGS;
+use ndarray::Array2;
+use std::cell::UnsafeCell;
+
+// ─────────────────────────────────────────────────────────────
+//  argmin problem wrapper
+// ─────────────────────────────────────────────────────────────
+
+/// Wraps the FDM problem + cache + barrier data so argmin can evaluate
+/// cost and gradient.
+///
+/// `UnsafeCell` is used for the cache because argmin's `CostFunction` /
+/// `Gradient` traits take `&self`, but our forward solver mutates the cache.
+/// The solver is single-threaded, so this is safe in practice.
+struct FdmProblem<'a> {
+    problem: &'a Problem,
+    cache: UnsafeCell<FdmCache>,
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    lb_idx: Vec<usize>,
+    ub_idx: Vec<usize>,
+}
+
+impl<'a> CostFunction for FdmProblem<'a> {
+    type Param = Vec<f64>;
+    type Output = f64;
+
+    fn cost(&self, theta: &Self::Param) -> Result<Self::Output, argmin::core::Error> {
+        let cache = unsafe { &mut *self.cache.get() };
+        let mut grad = vec![0.0; theta.len()];
+        let val = value_and_gradient(
+            cache,
+            self.problem,
+            theta,
+            &mut grad,
+            &self.lb,
+            &self.ub,
+            &self.lb_idx,
+            &self.ub_idx,
+        );
+        Ok(val)
+    }
+}
+
+impl<'a> Gradient for FdmProblem<'a> {
+    type Param = Vec<f64>;
+    type Gradient = Vec<f64>;
+
+    fn gradient(&self, theta: &Self::Param) -> Result<Self::Gradient, argmin::core::Error> {
+        let cache = unsafe { &mut *self.cache.get() };
+        let mut grad = vec![0.0; theta.len()];
+        let _ = value_and_gradient(
+            cache,
+            self.problem,
+            theta,
+            &mut grad,
+            &self.lb,
+            &self.ub,
+            &self.lb_idx,
+            &self.ub_idx,
+        );
+        Ok(grad)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Parameter packing / unpacking
+// ─────────────────────────────────────────────────────────────
+
+/// Pack q and anchor positions into a single θ vector.
+pub fn pack_parameters(problem: &Problem, state: &OptimizationState) -> Vec<f64> {
+    let ne = problem.topology.num_edges;
+    let nvar = problem.anchors.variable_indices.len();
+    let mut theta = Vec::with_capacity(ne + nvar * 3);
+    theta.extend_from_slice(&state.force_densities);
+    if nvar > 0 {
+        for i in 0..nvar {
+            theta.push(state.variable_anchor_positions[[i, 0]]);
+            theta.push(state.variable_anchor_positions[[i, 1]]);
+            theta.push(state.variable_anchor_positions[[i, 2]]);
+        }
+    }
+    theta
+}
+
+/// Unpack θ into q and anchor positions.
+pub fn unpack_parameters(problem: &Problem, theta: &[f64]) -> (Vec<f64>, Array2<f64>) {
+    let ne = problem.topology.num_edges;
+    let q = theta[..ne].to_vec();
+    let nvar = problem.anchors.variable_indices.len();
+    let anchors = if nvar > 0 {
+        let mut a = Array2::zeros((nvar, 3));
+        for i in 0..nvar {
+            a[[i, 0]] = theta[ne + i * 3];
+            a[[i, 1]] = theta[ne + i * 3 + 1];
+            a[[i, 2]] = theta[ne + i * 3 + 2];
+        }
+        a
+    } else {
+        Array2::zeros((0, 3))
+    };
+    (q, anchors)
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Bound index precomputation
+// ─────────────────────────────────────────────────────────────
+
+fn parameter_bounds(problem: &Problem) -> (Vec<f64>, Vec<f64>) {
+    let nvar = problem.anchors.variable_indices.len();
+    let mut lb = problem.bounds.lower.clone();
+    let mut ub = problem.bounds.upper.clone();
+    if nvar > 0 {
+        lb.extend(vec![f64::NEG_INFINITY; nvar * 3]);
+        ub.extend(vec![f64::INFINITY; nvar * 3]);
+    }
+    (lb, ub)
+}
+
+fn finite_indices(v: &[f64]) -> Vec<usize> {
+    v.iter().enumerate().filter(|(_, &x)| x.is_finite()).map(|(i, _)| i).collect()
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Top-level optimisation entry point
+// ─────────────────────────────────────────────────────────────
+
+/// Run L-BFGS optimisation on the FDM problem.
+///
+/// Returns a `SolverResult` with the optimised geometry.
+pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<SolverResult, argmin::core::Error> {
+    let cache = FdmCache::new(problem);
+
+    let (lb, ub) = parameter_bounds(problem);
+    let lb_idx = finite_indices(&lb);
+    let ub_idx = finite_indices(&ub);
+
+    let init_param = pack_parameters(problem, state);
+
+    let fdm_problem = FdmProblem {
+        problem,
+        cache: UnsafeCell::new(cache),
+        lb,
+        ub,
+        lb_idx,
+        ub_idx,
+    };
+
+    // Configure L-BFGS
+    let linesearch = MoreThuenteLineSearch::new();
+    let solver = LBFGS::new(linesearch, 10); // 10 correction pairs
+
+    let executor = Executor::new(fdm_problem, solver)
+        .configure(|config| {
+            config
+                .param(init_param)
+                .max_iters(problem.solver.max_iterations as u64)
+                .target_cost(f64::NEG_INFINITY)
+        });
+
+    let result = executor.run()?;
+
+    // Extract solution
+    let best_param = result.state().get_best_param().unwrap();
+    let (q, anchors) = unpack_parameters(problem, best_param);
+
+    // Final forward solve to get geometry
+    let mut final_cache = FdmCache::new(problem);
+    crate::fdm::solve_fdm(&mut final_cache, &q, problem, &anchors, 1e-12);
+    crate::fdm::compute_geometry(&mut final_cache, problem);
+
+    let converged = matches!(
+        result.state().get_termination_reason(),
+        Some(TerminationReason::SolverConverged)
+    );
+
+    state.force_densities = q.clone();
+    state.variable_anchor_positions = anchors.clone();
+    state.iterations = result.state().get_iter() as usize;
+
+    Ok(SolverResult {
+        q,
+        anchor_positions: anchors,
+        xyz: final_cache.nf,
+        member_lengths: final_cache.member_lengths,
+        member_forces: final_cache.member_forces,
+        reactions: final_cache.reactions,
+        loss_trace: Vec::new(), // TODO: collect via observer
+        iterations: state.iterations,
+        converged,
+    })
+}

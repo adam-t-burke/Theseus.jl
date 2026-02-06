@@ -1,0 +1,474 @@
+use ndarray::Array2;
+use sprs::CsMat;
+
+// ─────────────────────────────────────────────────────────────
+//  Constants
+// ─────────────────────────────────────────────────────────────
+
+pub const DEFAULT_BARRIER_SHARPNESS: f64 = 10.0;
+
+// ─────────────────────────────────────────────────────────────
+//  Objectives  (mirrors Julia's 13 AbstractObjective subtypes)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Objective {
+    TargetXYZ {
+        weight: f64,
+        node_indices: Vec<usize>,
+        target: Array2<f64>, // n × 3
+    },
+    TargetXY {
+        weight: f64,
+        node_indices: Vec<usize>,
+        target: Array2<f64>,
+    },
+    TargetLength {
+        weight: f64,
+        edge_indices: Vec<usize>,
+        target: Vec<f64>,
+    },
+    LengthVariation {
+        weight: f64,
+        edge_indices: Vec<usize>,
+    },
+    ForceVariation {
+        weight: f64,
+        edge_indices: Vec<usize>,
+    },
+    SumForceLength {
+        weight: f64,
+        edge_indices: Vec<usize>,
+    },
+    MinLength {
+        weight: f64,
+        edge_indices: Vec<usize>,
+        threshold: Vec<f64>,
+        sharpness: f64,
+    },
+    MaxLength {
+        weight: f64,
+        edge_indices: Vec<usize>,
+        threshold: Vec<f64>,
+        sharpness: f64,
+    },
+    MinForce {
+        weight: f64,
+        edge_indices: Vec<usize>,
+        threshold: Vec<f64>,
+        sharpness: f64,
+    },
+    MaxForce {
+        weight: f64,
+        edge_indices: Vec<usize>,
+        threshold: Vec<f64>,
+        sharpness: f64,
+    },
+    RigidSetCompare {
+        weight: f64,
+        node_indices: Vec<usize>,
+        target: Array2<f64>,
+    },
+    ReactionDirection {
+        weight: f64,
+        anchor_indices: Vec<usize>,
+        target_directions: Array2<f64>, // n × 3, unit rows
+    },
+    ReactionDirectionMagnitude {
+        weight: f64,
+        anchor_indices: Vec<usize>,
+        target_directions: Array2<f64>,
+        target_magnitudes: Vec<f64>,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Bounds
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Bounds {
+    pub lower: Vec<f64>,
+    pub upper: Vec<f64>,
+}
+
+impl Bounds {
+    pub fn default_for(num_edges: usize) -> Self {
+        Self {
+            lower: vec![1e-8; num_edges],
+            upper: vec![f64::INFINITY; num_edges],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Solver / Tracing options
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SolverOptions {
+    pub absolute_tolerance: f64,
+    pub relative_tolerance: f64,
+    pub max_iterations: usize,
+    pub report_frequency: usize,
+    pub barrier_weight: f64,
+    pub barrier_sharpness: f64,
+}
+
+impl Default for SolverOptions {
+    fn default() -> Self {
+        Self {
+            absolute_tolerance: 1e-6,
+            relative_tolerance: 1e-6,
+            max_iterations: 500,
+            report_frequency: 1,
+            barrier_weight: 1000.0,
+            barrier_sharpness: DEFAULT_BARRIER_SHARPNESS,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Network topology
+// ─────────────────────────────────────────────────────────────
+
+/// Compressed connectivity information built once from the incidence matrix.
+#[derive(Debug, Clone)]
+pub struct NetworkTopology {
+    /// Full incidence matrix  (ne × nn)  with ±1 entries.
+    pub incidence: CsMat<f64>,
+    /// Free-node incidence    (ne × nn_free)
+    pub free_incidence: CsMat<f64>,
+    /// Fixed-node incidence   (ne × nn_fixed)
+    pub fixed_incidence: CsMat<f64>,
+    pub num_edges: usize,
+    pub num_nodes: usize,
+    pub free_node_indices: Vec<usize>,
+    pub fixed_node_indices: Vec<usize>,
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Anchor info  (variable / fixed supports)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AnchorInfo {
+    pub variable_indices: Vec<usize>,
+    pub fixed_indices: Vec<usize>,
+    pub reference_positions: Array2<f64>,       // n_fixed × 3
+    pub initial_variable_positions: Array2<f64>, // n_var × 3
+}
+
+impl AnchorInfo {
+    /// All anchors fixed – no movable supports.
+    pub fn all_fixed(reference_positions: Array2<f64>) -> Self {
+        let n = reference_positions.nrows();
+        Self {
+            variable_indices: Vec::new(),
+            fixed_indices: (0..n).collect(),
+            reference_positions,
+            initial_variable_positions: Array2::zeros((0, 3)),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Problem definition  (immutable after construction)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Problem {
+    pub topology: NetworkTopology,
+    pub free_node_loads: Array2<f64>,  // nn_free × 3
+    pub fixed_node_positions: Array2<f64>, // n_fixed × 3  (reference)
+    pub anchors: AnchorInfo,
+    pub objectives: Vec<Objective>,
+    pub bounds: Bounds,
+    pub solver: SolverOptions,
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Sparsity mapping  q_k  →  A.data[] indices
+// ─────────────────────────────────────────────────────────────
+
+/// Pre-computed contribution of edge `k` to the CSC `nzval` array of A.
+#[derive(Debug, Clone)]
+pub struct QToNz {
+    /// For each edge k: list of (nz_index_in_A_data, coefficient)
+    pub entries: Vec<Vec<(usize, f64)>>,
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Factorisation strategy
+// ─────────────────────────────────────────────────────────────
+
+/// Adaptive factorisation for A(q) = Cn^T diag(q) Cn.
+/// Use Cholesky when bounds guarantee sign-definiteness; LDL otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactorisationStrategy {
+    /// All q_k > 0  (or all < 0):  A is SPD → Cholesky.
+    Cholesky,
+    /// Mixed sign q allowed:  A is symmetric indefinite → LDL.
+    LDL,
+}
+
+impl FactorisationStrategy {
+    /// Choose strategy from the bounds on q.
+    pub fn from_bounds(bounds: &Bounds) -> Self {
+        let all_positive = bounds.lower.iter().all(|&lb| lb > 0.0);
+        let all_negative = bounds.upper.iter().all(|&ub| ub < 0.0);
+        if all_positive || all_negative {
+            Self::Cholesky
+        } else {
+            Self::LDL
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Pre-allocated solver cache
+// ─────────────────────────────────────────────────────────────
+
+/// All mutable workspace for the forward solve, adjoint, and gradient
+/// accumulation.  Built once from a [`Problem`], reused across iterations.
+#[derive(Debug)]
+pub struct FdmCache {
+    // ── Sparse system ──────────────────────────────────────
+    /// System matrix  A = Cn^T diag(q) Cn   (CSC, nn_free × nn_free)
+    pub a_data: Vec<f64>,     // mutable nzval – same sparsity pattern as template
+    pub a_indptr: Vec<usize>, // column pointers (immutable after init)
+    pub a_indices: Vec<usize>, // row indices (immutable after init)
+    pub a_dim: usize,         // nn_free
+
+    pub q_to_nz: QToNz,
+
+    /// Start / end node of each edge (global node indices, 0-based)
+    pub edge_starts: Vec<usize>,
+    pub edge_ends: Vec<usize>,
+    /// Global-node → free-index mapping  (usize::MAX if fixed)
+    pub node_to_free_idx: Vec<usize>,
+
+    /// Cn  (ne × nn_free)  and  Cf  (ne × nn_fixed)  stored as CSC
+    pub cn: CsMat<f64>,
+    pub cf: CsMat<f64>,
+
+    // ── Primal buffers ─────────────────────────────────────
+    /// Free-node positions         (nn_free × 3, column-major)
+    pub x: Array2<f64>,
+    /// Adjoint variables           (nn_free × 3)
+    pub lambda: Array2<f64>,
+    /// dJ / d(free-node positions) (nn_free × 3)
+    pub grad_x: Array2<f64>,
+    /// Force densities
+    pub q: Vec<f64>,
+    /// dJ / dq
+    pub grad_q: Vec<f64>,
+    /// dJ / dNf  (all nodes × 3, only fixed rows used)
+    pub grad_nf: Array2<f64>,
+
+    // ── Derived geometry ───────────────────────────────────
+    pub member_lengths: Vec<f64>,
+    pub member_forces: Vec<f64>,
+    pub reactions: Array2<f64>, // nn × 3
+
+    // ── Intermediate RHS buffers ───────────────────────────
+    pub cf_nf: Array2<f64>,    // ne × 3
+    pub q_cf_nf: Array2<f64>,  // ne × 3
+    pub pn: Array2<f64>,       // nn_free × 3  (copy of free-node loads)
+    pub nf: Array2<f64>,       // nn × 3       (full node positions)
+    pub nf_fixed: Array2<f64>, // nn_fixed × 3
+
+    // ── RHS buffer (reusable for linear solve input) ───────
+    pub rhs: Array2<f64>,      // nn_free × 3
+
+    // ── Factorisation ──────────────────────────────────────
+    pub strategy: FactorisationStrategy,
+}
+
+impl FdmCache {
+    /// Build a fully pre-allocated cache from a [`Problem`].
+    pub fn new(problem: &Problem) -> Self {
+        let topo = &problem.topology;
+        let ne = topo.num_edges;
+        let nn = topo.num_nodes;
+        let nn_free = topo.free_node_indices.len();
+        let nn_fixed = topo.fixed_node_indices.len();
+
+        // ── 1. Build A's sparsity pattern from Cn^T * Cn ──
+        let cn = &topo.free_incidence; // ne × nn_free
+        let cn_t = cn.transpose_view().to_csc();
+        // Symbolic Cn^T * Cn to get the pattern
+        let a_template = &cn_t * cn;
+        let a_csc = a_template.to_csc();
+        let a_dim = nn_free;
+        let a_indptr: Vec<usize> = a_csc.indptr().into_raw_storage().to_vec();
+        let a_indices: Vec<usize> = a_csc.indices().to_vec();
+        let nnz = a_indices.len();
+        let a_data = vec![0.0f64; nnz];
+
+        // ── 2. Build q_to_nz mapping ──────────────────────
+        // For each edge k, find which free nodes it touches in Cn,
+        // then map those (n1, n2) pairs to indices in a_data.
+        let mut edge_to_free_nodes: Vec<Vec<(usize, f64)>> = vec![Vec::new(); ne];
+        // Iterate columns of Cn (CSC: each column = a free node)
+        let cn_csc = cn.to_csc();
+        for col in 0..nn_free {
+            let start = cn_csc.indptr().raw_storage()[col];
+            let end_ = cn_csc.indptr().raw_storage()[col + 1];
+            for idx in start..end_ {
+                let row = cn_csc.indices()[idx]; // edge index
+                let val = cn_csc.data()[idx];
+                edge_to_free_nodes[row].push((col, val));
+            }
+        }
+
+        let mut q_to_nz_entries: Vec<Vec<(usize, f64)>> = vec![Vec::new(); ne];
+        for k in 0..ne {
+            let nodes = &edge_to_free_nodes[k];
+            for &(n1, v1) in nodes {
+                for &(n2, v2) in nodes {
+                    // Find nz index of (n1, n2) in CSC  [row=n1, col=n2]
+                    let nz_idx = find_nz_index(&a_indptr, &a_indices, n1, n2)
+                        .expect("Sparsity pattern mismatch in q_to_nz");
+                    q_to_nz_entries[k].push((nz_idx, v1 * v2));
+                }
+            }
+        }
+
+        // ── 3. Edge start / end from incidence ────────────
+        let mut edge_starts = vec![0usize; ne];
+        let mut edge_ends = vec![0usize; ne];
+        let inc = &topo.incidence;
+        let inc_csc = inc.to_csc();
+        for col in 0..nn {
+            let start = inc_csc.indptr().raw_storage()[col];
+            let end_ = inc_csc.indptr().raw_storage()[col + 1];
+            for idx in start..end_ {
+                let row = inc_csc.indices()[idx];
+                let val = inc_csc.data()[idx];
+                if val == -1.0 {
+                    edge_starts[row] = col;
+                } else if val == 1.0 {
+                    edge_ends[row] = col;
+                }
+            }
+        }
+
+        // ── 4. node_to_free_idx ───────────────────────────
+        let mut node_to_free_idx = vec![usize::MAX; nn];
+        for (i, &node) in topo.free_node_indices.iter().enumerate() {
+            node_to_free_idx[node] = i;
+        }
+
+        // ── 5. Factorisation strategy ─────────────────────
+        let strategy = FactorisationStrategy::from_bounds(&problem.bounds);
+
+        // ── 6. Pre-allocate all buffers ───────────────────
+        let cf = topo.fixed_incidence.clone();
+        let cn_owned = cn.clone();
+
+        FdmCache {
+            a_data,
+            a_indptr,
+            a_indices,
+            a_dim,
+            q_to_nz: QToNz { entries: q_to_nz_entries },
+            edge_starts,
+            edge_ends,
+            node_to_free_idx,
+            cn: cn_owned,
+            cf,
+            x: Array2::zeros((nn_free, 3)),
+            lambda: Array2::zeros((nn_free, 3)),
+            grad_x: Array2::zeros((nn_free, 3)),
+            q: vec![0.0; ne],
+            grad_q: vec![0.0; ne],
+            grad_nf: Array2::zeros((nn, 3)),
+            member_lengths: vec![0.0; ne],
+            member_forces: vec![0.0; ne],
+            reactions: Array2::zeros((nn, 3)),
+            cf_nf: Array2::zeros((ne, 3)),
+            q_cf_nf: Array2::zeros((ne, 3)),
+            pn: problem.free_node_loads.clone(),
+            nf: Array2::zeros((nn, 3)),
+            nf_fixed: Array2::zeros((nn_fixed, 3)),
+            rhs: Array2::zeros((nn_free, 3)),
+            strategy,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Geometry snapshot  (read-only view after forward solve)
+// ─────────────────────────────────────────────────────────────
+
+/// Immutable snapshot of the geometry after a forward FDM solve.
+/// Views borrow from `FdmCache` buffers.
+pub struct GeometrySnapshot<'a> {
+    pub xyz_full: &'a Array2<f64>,     // nn × 3
+    pub member_lengths: &'a [f64],
+    pub member_forces: &'a [f64],
+    pub reactions: &'a Array2<f64>,     // nn × 3
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Optimisation state  (mutable across iterations)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct OptimizationState {
+    pub force_densities: Vec<f64>,
+    pub variable_anchor_positions: Array2<f64>, // n_var × 3
+    pub loss_trace: Vec<f64>,
+    pub iterations: usize,
+}
+
+impl OptimizationState {
+    pub fn new(q: Vec<f64>, anchors: Array2<f64>) -> Self {
+        Self {
+            force_densities: q,
+            variable_anchor_positions: anchors,
+            loss_trace: Vec::new(),
+            iterations: 0,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Solver result  (returned from optimize)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SolverResult {
+    pub q: Vec<f64>,
+    pub anchor_positions: Array2<f64>,
+    pub xyz: Array2<f64>,        // nn × 3
+    pub member_lengths: Vec<f64>,
+    pub member_forces: Vec<f64>,
+    pub reactions: Array2<f64>,  // nn × 3
+    pub loss_trace: Vec<f64>,
+    pub iterations: usize,
+    pub converged: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Helper: find nz index in CSC
+// ─────────────────────────────────────────────────────────────
+
+/// Given CSC indptr and indices arrays, find the position of element (row, col)
+/// in the data array.  Returns `None` if the entry is not in the sparsity pattern.
+pub fn find_nz_index(
+    indptr: &[usize],
+    indices: &[usize],
+    row: usize,
+    col: usize,
+) -> Option<usize> {
+    let start = indptr[col];
+    let end_ = indptr[col + 1];
+    for nz in start..end_ {
+        if indices[nz] == row {
+            return Some(nz);
+        }
+    }
+    None
+}
