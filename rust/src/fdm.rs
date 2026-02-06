@@ -2,7 +2,7 @@
 //!
 //! Mirrors `src/FDM.jl` from the Julia code.
 
-use crate::types::{FdmCache, Factorization, Problem};
+use crate::types::{FdmCache, Factorization, Problem, TheseusError};
 use ndarray::Array2;
 use sprs::CsMat;
 
@@ -108,7 +108,7 @@ pub fn assemble_rhs(cache: &mut FdmCache, problem: &Problem) {
 /// On first call, performs a fresh factorization (symbolic + numeric).
 /// On subsequent calls, reuses the symbolic structure via `Factorization::update()`
 /// — only numeric values change.
-pub fn factor_and_solve(cache: &mut FdmCache, perturbation: f64) {
+pub fn factor_and_solve(cache: &mut FdmCache, perturbation: f64) -> Result<(), TheseusError> {
     // Add diagonal perturbation if requested
     if perturbation > 0.0 {
         let n = cache.a_matrix.cols();
@@ -128,19 +128,18 @@ pub fn factor_and_solve(cache: &mut FdmCache, perturbation: f64) {
     let a_view = cache.a_matrix.view();
     match &mut cache.factorization {
         Some(fac) => {
-            fac.update(a_view)
-                .expect("Numeric re-factor failed (singular matrix?)");
+            fac.update(a_view)?;
         }
         None => {
             cache.factorization = Some(
-                Factorization::new(a_view, cache.strategy)
-                    .expect("Initial factorization failed")
+                Factorization::new(a_view, cache.strategy)?
             );
         }
     }
 
     // Solve for each coordinate column
-    let fac = cache.factorization.as_ref().unwrap();
+    let fac = cache.factorization.as_ref()
+        .ok_or(TheseusError::MissingFactorization)?;
     let n = cache.a_matrix.cols();
     for d in 0..3 {
         let rhs: Vec<f64> = (0..n).map(|i| cache.rhs[[i, d]]).collect();
@@ -149,6 +148,8 @@ pub fn factor_and_solve(cache: &mut FdmCache, perturbation: f64) {
             cache.x[[i, d]] = x[i];
         }
     }
+
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -163,7 +164,7 @@ pub fn solve_fdm(
     problem: &Problem,
     anchor_positions: &Array2<f64>,
     perturbation: f64,
-) {
+) -> Result<(), TheseusError> {
     // 0. Sync q
     cache.q.copy_from_slice(q);
 
@@ -177,7 +178,7 @@ pub fn solve_fdm(
     assemble_rhs(cache, problem);
 
     // 4. Factor A and solve A x = rhs
-    factor_and_solve(cache, perturbation);
+    factor_and_solve(cache, perturbation)?;
 
     // 5. Write free-node positions back to Nf
     for (i, &node) in problem.topology.free_node_indices.iter().enumerate() {
@@ -188,6 +189,8 @@ pub fn solve_fdm(
 
     // 6. Compute derived geometry
     compute_geometry(cache, problem);
+
+    Ok(())
 }
 
 /// Compute member lengths, forces, and reactions from current positions and q.

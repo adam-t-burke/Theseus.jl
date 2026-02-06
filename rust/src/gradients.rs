@@ -9,7 +9,7 @@
 //! All gradients derived analytically — no AD framework needed.
 
 use crate::objectives::{softplus_grad, bounds_penalty_grad};
-use crate::types::{FdmCache, GeometrySnapshot, Objective, Problem};
+use crate::types::{FdmCache, GeometrySnapshot, Objective, Problem, TheseusError};
 use ndarray::Array2;
 
 // ─────────────────────────────────────────────────────────────
@@ -20,18 +20,20 @@ use ndarray::Array2;
 ///
 /// Since A is symmetric (A = Aᵀ), we reuse the **same** factorization
 /// (Cholesky or LDL) from the forward solve — no refactoring needed.
-pub fn solve_adjoint(cache: &mut FdmCache) {
+pub fn solve_adjoint(cache: &mut FdmCache) -> Result<(), TheseusError> {
     let n = cache.a_matrix.cols();
 
     for d in 0..3 {
         let rhs: Vec<f64> = (0..n).map(|i| cache.grad_x[[i, d]]).collect();
         let x = cache.factorization.as_ref()
-            .expect("Factorization must exist before adjoint solve")
+            .ok_or(TheseusError::MissingFactorization)?
             .solve(&rhs);
         for i in 0..n {
             cache.lambda[[i, d]] = x[i];
         }
     }
+
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -566,7 +568,7 @@ pub fn value_and_gradient(
     ub: &[f64],
     lb_idx: &[usize],
     ub_idx: &[usize],
-) -> f64 {
+) -> Result<f64, TheseusError> {
     let ne = problem.topology.num_edges;
     let nvar = problem.anchors.variable_indices.len();
 
@@ -587,7 +589,7 @@ pub fn value_and_gradient(
     };
 
     // 2. Forward solve
-    crate::fdm::solve_fdm(cache, q, problem, &anchor_positions, 1e-12);
+    crate::fdm::solve_fdm(cache, q, problem, &anchor_positions, 1e-12)?;
 
     // 3. Build snapshot and evaluate loss
     let snap = GeometrySnapshot {
@@ -608,7 +610,7 @@ pub fn value_and_gradient(
     accumulate_explicit_gradients(cache, problem);
 
     // 5. Adjoint solve
-    solve_adjoint(cache);
+    solve_adjoint(cache)?;
 
     // 6. Implicit gradients
     accumulate_implicit_gradients(cache, problem);
@@ -635,5 +637,5 @@ pub fn value_and_gradient(
         problem.solver.barrier_weight,
     );
 
-    total
+    Ok(total)
 }

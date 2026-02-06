@@ -150,11 +150,11 @@ fn make_arch_problem(bounds: Bounds, objectives: Vec<Objective>) -> Problem {
 /// Evaluate loss-only at θ (without gradient — fresh cache each call so the
 /// factorisation is clean).
 fn eval_loss(problem: &Problem, theta: &[f64], lb: &[f64], ub: &[f64], lb_idx: &[usize], ub_idx: &[usize]) -> f64 {
-    let mut cache = FdmCache::new(problem);
+    let mut cache = FdmCache::new(problem).unwrap();
     let mut grad = vec![0.0; theta.len()];
     theseus::gradients::value_and_gradient(
         &mut cache, problem, theta, &mut grad, lb, ub, lb_idx, ub_idx,
-    )
+    ).unwrap()
 }
 
 /// Central-difference gradient test.
@@ -187,11 +187,11 @@ fn fd_gradient_check(
     let ub_idx: Vec<usize> = (0..ne).filter(|&i| ub[i].is_finite()).collect();
 
     // Analytic gradient
-    let mut cache = FdmCache::new(problem);
+    let mut cache = FdmCache::new(problem).unwrap();
     let mut grad_analytic = vec![0.0; n];
     let _loss = theseus::gradients::value_and_gradient(
         &mut cache, problem, theta, &mut grad_analytic, &lb, &ub, &lb_idx, &ub_idx,
-    );
+    ).unwrap();
 
     // FD gradient
     let mut grad_fd = vec![0.0; n];
@@ -615,19 +615,19 @@ fn cholesky_ldl_consistency() {
     let lb_idx_ldl: Vec<usize> = (0..ne).filter(|&i| lb_ldl[i].is_finite()).collect();
     let ub_idx_ldl: Vec<usize> = (0..ne).filter(|&i| ub_ldl[i].is_finite()).collect();
 
-    let mut cache_chol = FdmCache::new(&problem_chol);
+    let mut cache_chol = FdmCache::new(&problem_chol).unwrap();
     let mut grad_chol = vec![0.0; ne];
     let _loss_chol = theseus::gradients::value_and_gradient(
         &mut cache_chol, &problem_chol, &theta, &mut grad_chol,
         &lb_chol, &ub_chol, &lb_idx_chol, &ub_idx_chol,
-    );
+    ).unwrap();
 
-    let mut cache_ldl = FdmCache::new(&problem_ldl);
+    let mut cache_ldl = FdmCache::new(&problem_ldl).unwrap();
     let mut grad_ldl = vec![0.0; ne];
     let _loss_ldl = theseus::gradients::value_and_gradient(
         &mut cache_ldl, &problem_ldl, &theta, &mut grad_ldl,
         &lb_ldl, &ub_ldl, &lb_idx_ldl, &ub_idx_ldl,
-    );
+    ).unwrap();
 
     // Positions should match (same q, same network)
     let nn = problem_chol.topology.num_nodes;

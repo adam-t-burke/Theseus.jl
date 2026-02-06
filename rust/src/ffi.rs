@@ -1,25 +1,103 @@
 //! C-compatible FFI for Grasshopper (C# P/Invoke).
 //!
-//! All functions are `#[no_mangle] extern "C"` so they can be called from
-//! C# via `[DllImport("theseus")]`.
+//! # Architecture
 //!
-//! Memory convention:
+//! The FFI layer is deliberately thin — each `extern "C"` function does
+//! only two things:
+//!
+//!   1. **Marshal** raw pointers / lengths into safe Rust types.
+//!   2. **Delegate** to a safe, `Result`-returning inner function.
+//!
+//! All real logic lives in the core library (`types`, `fdm`, `gradients`,
+//! `optimizer`), which never panics.  Errors propagate as
+//! `Result<_, TheseusError>` and are translated at the FFI boundary to:
+//!
+//!   - `i32` return codes: 0 = success, negative = error.
+//!   - Thread-local error message retrievable via `theseus_last_error`.
+//!
+//! `catch_unwind` wraps every `extern "C"` as a **safety net only** — if it
+//! ever fires, that means we have a bug (an uncovered panic path in the
+//! core).  It exists solely to prevent UB from stack unwinding across FFI.
+//!
+//! # Memory convention
+//!
 //!   - Caller allocates flat arrays and passes pointers + lengths.
-//!   - Opaque handles (`*mut Problem`, `*mut FdmCache`) are created by
-//!     Rust and freed by Rust via explicit `_free` functions.
+//!   - Opaque handles (`*mut TheseusHandle`) are created by Rust and freed
+//!     by Rust via `theseus_free`.
 //!   - No JSON, no WebSocket — pure value types over the boundary.
 
 use crate::types::*;
 use crate::optimizer;
 use ndarray::Array2;
 use sprs::{CsMat, TriMat};
+use std::cell::RefCell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
 // ─────────────────────────────────────────────────────────────
-//  Opaque handle helpers
+//  Thread-local error message  (the SQLite pattern)
 // ─────────────────────────────────────────────────────────────
 
-/// Solver handle that owns the problem + cache + state.
+thread_local! {
+    static LAST_ERROR: RefCell<String> = RefCell::new(String::new());
+}
+
+/// Store an error message for later retrieval by `theseus_last_error`.
+fn set_last_error(msg: &str) {
+    LAST_ERROR.with(|e| *e.borrow_mut() = msg.to_owned());
+}
+
+/// Wrap an `extern "C"` body: calls the closure, translates `Result` to
+/// `i32`, stores error message, and uses `catch_unwind` as a final safety
+/// net against bugs.
+unsafe fn ffi_guard<F>(f: F) -> i32
+where
+    F: FnOnce() -> Result<(), TheseusError> + std::panic::UnwindSafe,
+{
+    match catch_unwind(f) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => {
+            set_last_error(&e.to_string());
+            -1
+        }
+        Err(_panic) => {
+            set_last_error("internal panic (this is a bug — please report it)");
+            -2
+        }
+    }
+}
+
+/// Retrieve the last error message.
+///
+/// Copies the UTF-8 message into a caller-provided buffer.  Returns the
+/// number of bytes written (excluding null terminator), or −1 if the
+/// buffer is too small.  A return of 0 means no error has been recorded.
+///
+/// # Safety
+/// `buf` must point to at least `buf_len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_last_error(buf: *mut u8, buf_len: usize) -> i32 {
+    LAST_ERROR.with(|e| {
+        let msg = e.borrow();
+        if msg.is_empty() {
+            return 0;
+        }
+        let bytes = msg.as_bytes();
+        if buf_len < bytes.len() + 1 {
+            return -1; // buffer too small
+        }
+        let out = slice::from_raw_parts_mut(buf, buf_len);
+        out[..bytes.len()].copy_from_slice(bytes);
+        out[bytes.len()] = 0; // null terminator
+        bytes.len() as i32
+    })
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Opaque handle
+// ─────────────────────────────────────────────────────────────
+
+/// Solver handle that owns the problem + state.
 pub struct TheseusHandle {
     pub problem: Problem,
     pub state: OptimizationState,
@@ -31,6 +109,9 @@ pub struct TheseusHandle {
 
 /// Create a new problem from raw arrays.
 ///
+/// Returns a valid handle pointer on success, or null on failure.
+/// On failure call `theseus_last_error` for details.
+///
 /// # Safety
 /// All pointers must be valid for the given lengths.
 #[no_mangle]
@@ -39,23 +120,54 @@ pub unsafe extern "C" fn theseus_create(
     num_edges: usize,
     num_nodes: usize,
     num_free: usize,
-    coo_rows: *const usize,    // length = nnz
+    coo_rows: *const usize,
     coo_cols: *const usize,
     coo_vals: *const f64,
     coo_nnz: usize,
-    free_node_indices: *const usize, // length = num_free
-    fixed_node_indices: *const usize, // length = num_nodes - num_free
+    free_node_indices: *const usize,
+    fixed_node_indices: *const usize,
     num_fixed: usize,
     // ── Loads & geometry ──
-    loads: *const f64,             // num_free × 3  row-major
-    fixed_positions: *const f64,   // num_fixed × 3 row-major
+    loads: *const f64,
+    fixed_positions: *const f64,
     // ── Initial q ──
-    q_init: *const f64,            // length = num_edges
+    q_init: *const f64,
     // ── Bounds ──
-    lower_bounds: *const f64,      // length = num_edges
+    lower_bounds: *const f64,
     upper_bounds: *const f64,
 ) -> *mut TheseusHandle {
-    // Reconstruct slices
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        create_inner(
+            num_edges, num_nodes, num_free,
+            coo_rows, coo_cols, coo_vals, coo_nnz,
+            free_node_indices, fixed_node_indices, num_fixed,
+            loads, fixed_positions,
+            q_init, lower_bounds, upper_bounds,
+        )
+    }));
+
+    match result {
+        Ok(Ok(ptr)) => ptr,
+        Ok(Err(e)) => {
+            set_last_error(&e.to_string());
+            std::ptr::null_mut()
+        }
+        Err(_panic) => {
+            set_last_error("internal panic in theseus_create (this is a bug)");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Safe inner function for `theseus_create`.  All pointer-to-slice
+/// conversion happens here; everything downstream is pure safe Rust.
+unsafe fn create_inner(
+    num_edges: usize, num_nodes: usize, num_free: usize,
+    coo_rows: *const usize, coo_cols: *const usize, coo_vals: *const f64, coo_nnz: usize,
+    free_node_indices: *const usize, fixed_node_indices: *const usize, num_fixed: usize,
+    loads: *const f64, fixed_positions: *const f64,
+    q_init: *const f64, lower_bounds: *const f64, upper_bounds: *const f64,
+) -> Result<*mut TheseusHandle, TheseusError> {
     let rows = slice::from_raw_parts(coo_rows, coo_nnz);
     let cols = slice::from_raw_parts(coo_cols, coo_nnz);
     let vals = slice::from_raw_parts(coo_vals, coo_nnz);
@@ -74,7 +186,6 @@ pub unsafe extern "C" fn theseus_create(
     }
     let incidence = tri.to_csc();
 
-    // Free / fixed sub-matrices
     let free_inc = extract_columns(&incidence, &free_idx);
     let fixed_inc = extract_columns(&incidence, &fixed_idx);
 
@@ -88,17 +199,11 @@ pub unsafe extern "C" fn theseus_create(
         fixed_node_indices: fixed_idx.clone(),
     };
 
-    // Loads: row-major num_free × 3
-    let free_node_loads = Array2::from_shape_vec(
-        (num_free, 3),
-        loads_slice.to_vec(),
-    ).unwrap();
+    let free_node_loads = Array2::from_shape_vec((num_free, 3), loads_slice.to_vec())
+        .map_err(|e| TheseusError::Shape(format!("loads: {e}")))?;
 
-    // Fixed positions
-    let fixed_node_positions = Array2::from_shape_vec(
-        (num_fixed, 3),
-        fixed_pos_slice.to_vec(),
-    ).unwrap();
+    let fixed_node_positions = Array2::from_shape_vec((num_fixed, 3), fixed_pos_slice.to_vec())
+        .map_err(|e| TheseusError::Shape(format!("fixed_positions: {e}")))?;
 
     let anchors = AnchorInfo::all_fixed(fixed_node_positions.clone());
 
@@ -117,30 +222,28 @@ pub unsafe extern "C" fn theseus_create(
         solver: SolverOptions::default(),
     };
 
-    let state = OptimizationState::new(
-        q_slice.to_vec(),
-        Array2::zeros((0, 3)),
-    );
+    let state = OptimizationState::new(q_slice.to_vec(), Array2::zeros((0, 3)));
 
-    Box::into_raw(Box::new(TheseusHandle { problem, state }))
+    Ok(Box::into_raw(Box::new(TheseusHandle { problem, state })))
 }
 
 /// Free a handle.
 ///
 /// # Safety
-/// `handle` must be a pointer returned by `theseus_create`.
+/// `handle` must be a pointer returned by `theseus_create`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn theseus_free(handle: *mut TheseusHandle) {
-    if !handle.is_null() {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
         drop(Box::from_raw(handle));
-    }
+    }));
 }
 
 // ─────────────────────────────────────────────────────────────
 //  Objective registration
 // ─────────────────────────────────────────────────────────────
 
-/// Add a TargetXYZ objective.
+/// Add a TargetXYZ objective.  Returns 0 on success.
 ///
 /// # Safety
 /// Valid handle and arrays.
@@ -150,22 +253,21 @@ pub unsafe extern "C" fn theseus_add_target_xyz(
     weight: f64,
     node_indices: *const usize,
     num_nodes: usize,
-    target_xyz: *const f64, // num_nodes × 3 row-major
-) {
-    let h = &mut *handle;
-    let idx = slice::from_raw_parts(node_indices, num_nodes).to_vec();
-    let target = Array2::from_shape_vec(
-        (num_nodes, 3),
-        slice::from_raw_parts(target_xyz, num_nodes * 3).to_vec(),
-    ).unwrap();
-    h.problem.objectives.push(Objective::TargetXYZ {
-        weight,
-        node_indices: idx,
-        target,
-    });
+    target_xyz: *const f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(node_indices, num_nodes).to_vec();
+        let target = Array2::from_shape_vec(
+            (num_nodes, 3),
+            slice::from_raw_parts(target_xyz, num_nodes * 3).to_vec(),
+        ).map_err(|e| TheseusError::Shape(format!("target_xyz: {e}")))?;
+        h.problem.objectives.push(Objective::TargetXYZ { weight, node_indices: idx, target });
+        Ok(())
+    }))
 }
 
-/// Add a TargetLength objective.
+/// Add a TargetLength objective.  Returns 0 on success.
 ///
 /// # Safety
 /// Valid handle and arrays.
@@ -176,18 +278,17 @@ pub unsafe extern "C" fn theseus_add_target_length(
     edge_indices: *const usize,
     num_edges: usize,
     targets: *const f64,
-) {
-    let h = &mut *handle;
-    let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
-    let tgt = slice::from_raw_parts(targets, num_edges).to_vec();
-    h.problem.objectives.push(Objective::TargetLength {
-        weight,
-        edge_indices: idx,
-        target: tgt,
-    });
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        let tgt = slice::from_raw_parts(targets, num_edges).to_vec();
+        h.problem.objectives.push(Objective::TargetLength { weight, edge_indices: idx, target: tgt });
+        Ok(())
+    }))
 }
 
-/// Add a MinLength barrier objective.
+/// Add a MinLength barrier objective.  Returns 0 on success.
 ///
 /// # Safety
 /// Valid handle and arrays.
@@ -199,19 +300,19 @@ pub unsafe extern "C" fn theseus_add_min_length(
     num_edges: usize,
     thresholds: *const f64,
     sharpness: f64,
-) {
-    let h = &mut *handle;
-    let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
-    let thr = slice::from_raw_parts(thresholds, num_edges).to_vec();
-    h.problem.objectives.push(Objective::MinLength {
-        weight,
-        edge_indices: idx,
-        threshold: thr,
-        sharpness,
-    });
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        let thr = slice::from_raw_parts(thresholds, num_edges).to_vec();
+        h.problem.objectives.push(Objective::MinLength {
+            weight, edge_indices: idx, threshold: thr, sharpness,
+        });
+        Ok(())
+    }))
 }
 
-/// Configure solver options.
+/// Configure solver options.  Returns 0 on success.
 ///
 /// # Safety
 /// Valid handle.
@@ -223,16 +324,19 @@ pub unsafe extern "C" fn theseus_set_solver_options(
     rel_tol: f64,
     barrier_weight: f64,
     barrier_sharpness: f64,
-) {
-    let h = &mut *handle;
-    h.problem.solver = SolverOptions {
-        max_iterations,
-        absolute_tolerance: abs_tol,
-        relative_tolerance: rel_tol,
-        report_frequency: 1,
-        barrier_weight,
-        barrier_sharpness,
-    };
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.problem.solver = SolverOptions {
+            max_iterations,
+            absolute_tolerance: abs_tol,
+            relative_tolerance: rel_tol,
+            report_frequency: 1,
+            barrier_weight,
+            barrier_sharpness,
+        };
+        Ok(())
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -241,57 +345,55 @@ pub unsafe extern "C" fn theseus_set_solver_options(
 
 /// Run L-BFGS optimisation.  Results are written into caller-provided buffers.
 ///
-/// Returns 0 on success, non-zero on error.
+/// Returns 0 on success, -1 on error (call `theseus_last_error` for details),
+/// -2 on internal panic (a bug).
 ///
 /// # Safety
 /// All output buffers must have the correct sizes.
 #[no_mangle]
 pub unsafe extern "C" fn theseus_optimize(
     handle: *mut TheseusHandle,
-    // ── Outputs ──
-    out_xyz: *mut f64,           // num_nodes × 3 row-major
-    out_lengths: *mut f64,       // num_edges
-    out_forces: *mut f64,        // num_edges
-    out_q: *mut f64,             // num_edges
-    out_reactions: *mut f64,     // num_nodes × 3 row-major
+    out_xyz: *mut f64,
+    out_lengths: *mut f64,
+    out_forces: *mut f64,
+    out_q: *mut f64,
+    out_reactions: *mut f64,
     out_iterations: *mut usize,
     out_converged: *mut bool,
 ) -> i32 {
-    let h = &mut *handle;
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let result = optimizer::optimize(&h.problem, &mut h.state)?;
 
-    match optimizer::optimize(&h.problem, &mut h.state) {
-        Ok(result) => {
-            let nn = h.problem.topology.num_nodes;
-            let ne = h.problem.topology.num_edges;
+        let nn = h.problem.topology.num_nodes;
+        let ne = h.problem.topology.num_edges;
 
-            // Copy xyz
-            let xyz_out = slice::from_raw_parts_mut(out_xyz, nn * 3);
-            for i in 0..nn {
-                for d in 0..3 {
-                    xyz_out[i * 3 + d] = result.xyz[[i, d]];
-                }
+        // Copy xyz
+        let xyz_out = slice::from_raw_parts_mut(out_xyz, nn * 3);
+        for i in 0..nn {
+            for d in 0..3 {
+                xyz_out[i * 3 + d] = result.xyz[[i, d]];
             }
-
-            // Copy lengths, forces, q
-            slice::from_raw_parts_mut(out_lengths, ne).copy_from_slice(&result.member_lengths);
-            slice::from_raw_parts_mut(out_forces, ne).copy_from_slice(&result.member_forces);
-            slice::from_raw_parts_mut(out_q, ne).copy_from_slice(&result.q);
-
-            // Copy reactions
-            let r_out = slice::from_raw_parts_mut(out_reactions, nn * 3);
-            for i in 0..nn {
-                for d in 0..3 {
-                    r_out[i * 3 + d] = result.reactions[[i, d]];
-                }
-            }
-
-            *out_iterations = result.iterations;
-            *out_converged = result.converged;
-
-            0 // success
         }
-        Err(_) => 1, // error
-    }
+
+        // Copy lengths, forces, q
+        slice::from_raw_parts_mut(out_lengths, ne).copy_from_slice(&result.member_lengths);
+        slice::from_raw_parts_mut(out_forces, ne).copy_from_slice(&result.member_forces);
+        slice::from_raw_parts_mut(out_q, ne).copy_from_slice(&result.q);
+
+        // Copy reactions
+        let r_out = slice::from_raw_parts_mut(out_reactions, nn * 3);
+        for i in 0..nn {
+            for d in 0..3 {
+                r_out[i * 3 + d] = result.reactions[[i, d]];
+            }
+        }
+
+        *out_iterations = result.iterations;
+        *out_converged = result.converged;
+
+        Ok(())
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -300,34 +402,38 @@ pub unsafe extern "C" fn theseus_optimize(
 
 /// Single forward FDM solve — useful for previewing geometry without optimising.
 ///
+/// Returns 0 on success, -1 on error, -2 on internal panic.
+///
 /// # Safety
 /// Valid handle and output buffers.
 #[no_mangle]
 pub unsafe extern "C" fn theseus_solve_forward(
     handle: *mut TheseusHandle,
-    out_xyz: *mut f64,       // num_nodes × 3
-    out_lengths: *mut f64,   // num_edges
-    out_forces: *mut f64,    // num_edges
+    out_xyz: *mut f64,
+    out_lengths: *mut f64,
+    out_forces: *mut f64,
 ) -> i32 {
-    let h = &mut *handle;
-    let mut cache = FdmCache::new(&h.problem);
-    let anchors = h.state.variable_anchor_positions.clone();
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let mut cache = FdmCache::new(&h.problem)?;
+        let anchors = h.state.variable_anchor_positions.clone();
 
-    crate::fdm::solve_fdm(&mut cache, &h.state.force_densities, &h.problem, &anchors, 1e-12);
+        crate::fdm::solve_fdm(&mut cache, &h.state.force_densities, &h.problem, &anchors, 1e-12)?;
 
-    let nn = h.problem.topology.num_nodes;
-    let ne = h.problem.topology.num_edges;
+        let nn = h.problem.topology.num_nodes;
+        let ne = h.problem.topology.num_edges;
 
-    let xyz_out = slice::from_raw_parts_mut(out_xyz, nn * 3);
-    for i in 0..nn {
-        for d in 0..3 {
-            xyz_out[i * 3 + d] = cache.nf[[i, d]];
+        let xyz_out = slice::from_raw_parts_mut(out_xyz, nn * 3);
+        for i in 0..nn {
+            for d in 0..3 {
+                xyz_out[i * 3 + d] = cache.nf[[i, d]];
+            }
         }
-    }
-    slice::from_raw_parts_mut(out_lengths, ne).copy_from_slice(&cache.member_lengths);
-    slice::from_raw_parts_mut(out_forces, ne).copy_from_slice(&cache.member_forces);
+        slice::from_raw_parts_mut(out_lengths, ne).copy_from_slice(&cache.member_lengths);
+        slice::from_raw_parts_mut(out_forces, ne).copy_from_slice(&cache.member_forces);
 
-    0
+        Ok(())
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────

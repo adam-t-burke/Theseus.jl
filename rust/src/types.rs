@@ -1,6 +1,66 @@
 use ndarray::Array2;
 use sprs::{CsMat, FillInReduction, SymmetryCheck};
 use sprs_ldl::{Ldl, LdlNumeric};
+use std::fmt;
+
+// ─────────────────────────────────────────────────────────────
+//  Error type
+// ─────────────────────────────────────────────────────────────
+
+/// Unified error type for all fallible operations in the crate.
+///
+/// Every function in the public Rust API returns `Result<T, TheseusError>`
+/// instead of panicking.  The FFI layer translates these into integer
+/// return codes + a thread-local error message.
+#[derive(Debug)]
+pub enum TheseusError {
+    /// Linear algebra failure (singular / not-SPD matrix, etc.).
+    Linalg(sprs::errors::LinalgError),
+    /// Sparsity pattern is inconsistent (should never happen after
+    /// a correct `FdmCache::new`).
+    SparsityMismatch { edge: usize, row: usize, col: usize },
+    /// The factorization has not been computed yet.
+    MissingFactorization,
+    /// Argmin solver returned an error.
+    Solver(String),
+    /// Shape mismatch in input data.
+    Shape(String),
+}
+
+impl fmt::Display for TheseusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Linalg(e) => write!(f, "linear algebra error: {e}"),
+            Self::SparsityMismatch { edge, row, col } =>
+                write!(f, "sparsity pattern mismatch: edge {edge}, ({row},{col}) not in A"),
+            Self::MissingFactorization =>
+                write!(f, "factorization not computed (call solve_fdm first)"),
+            Self::Solver(msg) => write!(f, "solver error: {msg}"),
+            Self::Shape(msg) => write!(f, "shape error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for TheseusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Linalg(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<sprs::errors::LinalgError> for TheseusError {
+    fn from(e: sprs::errors::LinalgError) -> Self {
+        Self::Linalg(e)
+    }
+}
+
+impl From<argmin::core::Error> for TheseusError {
+    fn from(e: argmin::core::Error) -> Self {
+        Self::Solver(e.to_string())
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Constants
@@ -384,7 +444,9 @@ pub struct FdmCache {
 
 impl FdmCache {
     /// Build a fully pre-allocated cache from a [`Problem`].
-    pub fn new(problem: &Problem) -> Self {
+    ///
+    /// Returns `Err` if the incidence sparsity pattern is inconsistent.
+    pub fn new(problem: &Problem) -> Result<Self, TheseusError> {
         let topo = &problem.topology;
         let ne = topo.num_edges;
         let nn = topo.num_nodes;
@@ -422,7 +484,7 @@ impl FdmCache {
                     // Find nz index of (n1, n2) in CSC  [row=n1, col=n2]
                     let indptr = a_matrix.indptr();
                     let nz_idx = find_nz_index(indptr.raw_storage(), a_matrix.indices(), n1, n2)
-                        .expect("Sparsity pattern mismatch in q_to_nz");
+                        .ok_or(TheseusError::SparsityMismatch { edge: k, row: n1, col: n2 })?;
                     q_to_nz_entries[k].push((nz_idx, v1 * v2));
                 }
             }
@@ -460,7 +522,7 @@ impl FdmCache {
         let cf = topo.fixed_incidence.clone();
         let cn_owned = cn.clone();
 
-        FdmCache {
+        Ok(FdmCache {
             a_matrix,
             factorization: None,
             q_to_nz: QToNz { entries: q_to_nz_entries },
@@ -485,7 +547,7 @@ impl FdmCache {
             nf_fixed: Array2::zeros((nn_fixed, 3)),
             rhs: Array2::zeros((nn_free, 3)),
             strategy,
-        }
+        })
     }
 }
 

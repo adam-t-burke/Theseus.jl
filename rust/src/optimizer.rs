@@ -7,12 +7,12 @@
 //! conflicts between our ndarray 0.16 and argmin-math's bundled ndarray.
 
 use crate::gradients::value_and_gradient;
-use crate::types::{FdmCache, Problem, SolverResult, OptimizationState};
+use crate::types::{FdmCache, Problem, SolverResult, OptimizationState, TheseusError};
 use argmin::core::{CostFunction, Gradient, Executor, State, TerminationReason};
 use argmin::solver::linesearch::MoreThuenteLineSearch;
 use argmin::solver::quasinewton::LBFGS;
 use ndarray::Array2;
-use std::cell::UnsafeCell;
+use std::cell::RefCell;
 
 // ─────────────────────────────────────────────────────────────
 //  argmin problem wrapper
@@ -21,12 +21,13 @@ use std::cell::UnsafeCell;
 /// Wraps the FDM problem + cache + barrier data so argmin can evaluate
 /// cost and gradient.
 ///
-/// `UnsafeCell` is used for the cache because argmin's `CostFunction` /
+/// `RefCell` is used for the cache because argmin's `CostFunction` /
 /// `Gradient` traits take `&self`, but our forward solver mutates the cache.
-/// The solver is single-threaded, so this is safe in practice.
+/// The solver is single-threaded, so the borrow never actually conflicts,
+/// but `RefCell` gives us debug-mode borrow checking for free.
 struct FdmProblem<'a> {
     problem: &'a Problem,
-    cache: UnsafeCell<FdmCache>,
+    cache: RefCell<FdmCache>,
     lb: Vec<f64>,
     ub: Vec<f64>,
     lb_idx: Vec<usize>,
@@ -38,10 +39,10 @@ impl<'a> CostFunction for FdmProblem<'a> {
     type Output = f64;
 
     fn cost(&self, theta: &Self::Param) -> Result<Self::Output, argmin::core::Error> {
-        let cache = unsafe { &mut *self.cache.get() };
+        let mut cache = self.cache.borrow_mut();
         let mut grad = vec![0.0; theta.len()];
         let val = value_and_gradient(
-            cache,
+            &mut cache,
             self.problem,
             theta,
             &mut grad,
@@ -49,7 +50,7 @@ impl<'a> CostFunction for FdmProblem<'a> {
             &self.ub,
             &self.lb_idx,
             &self.ub_idx,
-        );
+        ).map_err(|e| argmin::core::Error::msg(e.to_string()))?;
         Ok(val)
     }
 }
@@ -59,10 +60,10 @@ impl<'a> Gradient for FdmProblem<'a> {
     type Gradient = Vec<f64>;
 
     fn gradient(&self, theta: &Self::Param) -> Result<Self::Gradient, argmin::core::Error> {
-        let cache = unsafe { &mut *self.cache.get() };
+        let mut cache = self.cache.borrow_mut();
         let mut grad = vec![0.0; theta.len()];
-        let _ = value_and_gradient(
-            cache,
+        value_and_gradient(
+            &mut cache,
             self.problem,
             theta,
             &mut grad,
@@ -70,7 +71,7 @@ impl<'a> Gradient for FdmProblem<'a> {
             &self.ub,
             &self.lb_idx,
             &self.ub_idx,
-        );
+        ).map_err(|e| argmin::core::Error::msg(e.to_string()))?;
         Ok(grad)
     }
 }
@@ -140,8 +141,8 @@ fn finite_indices(v: &[f64]) -> Vec<usize> {
 /// Run L-BFGS optimisation on the FDM problem.
 ///
 /// Returns a `SolverResult` with the optimised geometry.
-pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<SolverResult, argmin::core::Error> {
-    let cache = FdmCache::new(problem);
+pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<SolverResult, TheseusError> {
+    let cache = FdmCache::new(problem)?;
 
     let (lb, ub) = parameter_bounds(problem);
     let lb_idx = finite_indices(&lb);
@@ -151,7 +152,7 @@ pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<Solv
 
     let fdm_problem = FdmProblem {
         problem,
-        cache: UnsafeCell::new(cache),
+        cache: RefCell::new(cache),
         lb,
         ub,
         lb_idx,
@@ -173,12 +174,13 @@ pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<Solv
     let result = executor.run()?;
 
     // Extract solution
-    let best_param = result.state().get_best_param().unwrap();
+    let best_param = result.state().get_best_param()
+        .ok_or_else(|| TheseusError::Solver("L-BFGS returned no best parameters".into()))?;
     let (q, anchors) = unpack_parameters(problem, best_param);
 
     // Final forward solve to get geometry
-    let mut final_cache = FdmCache::new(problem);
-    crate::fdm::solve_fdm(&mut final_cache, &q, problem, &anchors, 1e-12);
+    let mut final_cache = FdmCache::new(problem)?;
+    crate::fdm::solve_fdm(&mut final_cache, &q, problem, &anchors, 1e-12)?;
     crate::fdm::compute_geometry(&mut final_cache, problem);
 
     let converged = matches!(
