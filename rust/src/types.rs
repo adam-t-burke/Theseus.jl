@@ -2,6 +2,7 @@ use ndarray::Array2;
 use sprs::{CsMat, FillInReduction, SymmetryCheck};
 use sprs_ldl::{Ldl, LdlNumeric};
 use std::fmt;
+use std::fmt::Debug;
 
 // ─────────────────────────────────────────────────────────────
 //  Error type
@@ -69,80 +70,127 @@ impl From<argmin::core::Error> for TheseusError {
 pub const DEFAULT_BARRIER_SHARPNESS: f64 = 10.0;
 
 // ─────────────────────────────────────────────────────────────
-//  Objectives  (mirrors Julia's 13 AbstractObjective subtypes)
+//  Objective trait  (extensible — implement for custom objectives)
+// ─────────────────────────────────────────────────────────────
+
+/// Trait for form-finding objectives.
+///
+/// Implement `loss` and `accumulate_gradient` to add custom objectives.
+/// The gradient method must accumulate into `cache.grad_x` (for implicit
+/// adjoint contributions) and/or `cache.grad_q` (for explicit q gradients).
+pub trait ObjectiveTrait: Debug + Send + Sync {
+    /// Scalar loss contribution from this objective.
+    fn loss(&self, snap: &GeometrySnapshot) -> f64;
+
+    /// Accumulate dJ/dx̂ into `cache.grad_x` and explicit dJ/dq into
+    /// `cache.grad_q`.  Called before the adjoint solve.
+    fn accumulate_gradient(
+        &self,
+        cache: &mut FdmCache,
+        problem: &Problem,
+    );
+
+    /// Weight of this objective (used for display/debugging).
+    fn weight(&self) -> f64;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Built-in objective structs  (13 types from the Julia code)
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub enum Objective {
-    TargetXYZ {
-        weight: f64,
-        node_indices: Vec<usize>,
-        target: Array2<f64>, // n × 3
-    },
-    TargetXY {
-        weight: f64,
-        node_indices: Vec<usize>,
-        target: Array2<f64>,
-    },
-    TargetLength {
-        weight: f64,
-        edge_indices: Vec<usize>,
-        target: Vec<f64>,
-    },
-    LengthVariation {
-        weight: f64,
-        edge_indices: Vec<usize>,
-        sharpness: f64,
-    },
-    ForceVariation {
-        weight: f64,
-        edge_indices: Vec<usize>,
-        sharpness: f64,
-    },
-    SumForceLength {
-        weight: f64,
-        edge_indices: Vec<usize>,
-    },
-    MinLength {
-        weight: f64,
-        edge_indices: Vec<usize>,
-        threshold: Vec<f64>,
-        sharpness: f64,
-    },
-    MaxLength {
-        weight: f64,
-        edge_indices: Vec<usize>,
-        threshold: Vec<f64>,
-        sharpness: f64,
-    },
-    MinForce {
-        weight: f64,
-        edge_indices: Vec<usize>,
-        threshold: Vec<f64>,
-        sharpness: f64,
-    },
-    MaxForce {
-        weight: f64,
-        edge_indices: Vec<usize>,
-        threshold: Vec<f64>,
-        sharpness: f64,
-    },
-    RigidSetCompare {
-        weight: f64,
-        node_indices: Vec<usize>,
-        target: Array2<f64>,
-    },
-    ReactionDirection {
-        weight: f64,
-        anchor_indices: Vec<usize>,
-        target_directions: Array2<f64>, // n × 3, unit rows
-    },
-    ReactionDirectionMagnitude {
-        weight: f64,
-        anchor_indices: Vec<usize>,
-        target_directions: Array2<f64>,
-        target_magnitudes: Vec<f64>,
-    },
+pub struct TargetXYZ {
+    pub weight: f64,
+    pub node_indices: Vec<usize>,
+    pub target: Array2<f64>, // n × 3
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetXY {
+    pub weight: f64,
+    pub node_indices: Vec<usize>,
+    pub target: Array2<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetLength {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+    pub target: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LengthVariation {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+    pub sharpness: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForceVariation {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+    pub sharpness: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SumForceLength {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MinLength {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+    pub threshold: Vec<f64>,
+    pub sharpness: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaxLength {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+    pub threshold: Vec<f64>,
+    pub sharpness: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MinForce {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+    pub threshold: Vec<f64>,
+    pub sharpness: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaxForce {
+    pub weight: f64,
+    pub edge_indices: Vec<usize>,
+    pub threshold: Vec<f64>,
+    pub sharpness: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RigidSetCompare {
+    pub weight: f64,
+    pub node_indices: Vec<usize>,
+    pub target: Array2<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReactionDirection {
+    pub weight: f64,
+    pub anchor_indices: Vec<usize>,
+    pub target_directions: Array2<f64>, // n × 3, unit rows
+}
+
+#[derive(Debug, Clone)]
+pub struct ReactionDirectionMagnitude {
+    pub weight: f64,
+    pub anchor_indices: Vec<usize>,
+    pub target_directions: Array2<f64>,
+    pub target_magnitudes: Vec<f64>,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -187,6 +235,74 @@ impl Default for SolverOptions {
             report_frequency: 1,
             barrier_weight: 1000.0,
             barrier_sharpness: DEFAULT_BARRIER_SHARPNESS,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Constraints  (nonlinear inequality constraints handled by AL)
+// ─────────────────────────────────────────────────────────────
+
+/// Nonlinear inequality constraint  g(q) ≤ 0.
+///
+/// Currently supports edge-length upper bounds (cable inextensibility).
+/// The augmented Lagrangian outer loop in `optimizer::optimize_constrained`
+/// drives these to satisfaction.
+#[derive(Debug, Clone)]
+pub enum Constraint {
+    /// Cable inextensibility:  ℓ_k(q) ≤ max_length_k  for each selected edge.
+    MaxLength {
+        edge_indices: Vec<usize>,
+        max_lengths: Vec<f64>,
+    },
+}
+
+/// Settings for the augmented Lagrangian outer loop.
+#[derive(Debug, Clone)]
+pub struct ALSettings {
+    /// Initial penalty parameter μ.
+    pub mu_init: f64,
+    /// Multiplicative growth factor for μ each outer iteration.
+    pub mu_factor: f64,
+    /// Maximum value of μ (prevents ill-conditioning).
+    pub mu_max: f64,
+    /// Maximum number of outer AL iterations.
+    pub max_outer_iters: usize,
+    /// Constraint feasibility tolerance: stop when max|g⁺| < tol.
+    pub constraint_tol: f64,
+}
+
+impl Default for ALSettings {
+    fn default() -> Self {
+        Self {
+            mu_init: 10.0,
+            mu_factor: 5.0,
+            mu_max: 1e8,
+            max_outer_iters: 20,
+            constraint_tol: 1e-4,
+        }
+    }
+}
+
+/// Mutable state for the augmented Lagrangian multipliers.
+#[derive(Debug, Clone)]
+pub struct ALState {
+    /// Lagrange multiplier estimates λ_k ≥ 0, one per constraint scalar.
+    pub lambdas: Vec<f64>,
+    /// Current penalty parameter μ.
+    pub mu: f64,
+}
+
+impl ALState {
+    /// Allocate from a list of constraints.  Total number of scalar
+    /// constraints = Σ |edge_indices| across all `Constraint` entries.
+    pub fn new(constraints: &[Constraint], settings: &ALSettings) -> Self {
+        let n: usize = constraints.iter().map(|c| match c {
+            Constraint::MaxLength { edge_indices, .. } => edge_indices.len(),
+        }).sum();
+        Self {
+            lambdas: vec![0.0; n],
+            mu: settings.mu_init,
         }
     }
 }
@@ -239,13 +355,14 @@ impl AnchorInfo {
 //  Problem definition  (immutable after construction)
 // ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Problem {
     pub topology: NetworkTopology,
     pub free_node_loads: Array2<f64>,  // nn_free × 3
     pub fixed_node_positions: Array2<f64>, // n_fixed × 3  (reference)
     pub anchors: AnchorInfo,
-    pub objectives: Vec<Objective>,
+    pub objectives: Vec<Box<dyn ObjectiveTrait>>,
+    pub constraints: Vec<Constraint>,
     pub bounds: Bounds,
     pub solver: SolverOptions,
 }
@@ -404,8 +521,8 @@ pub struct FdmCache {
     /// Start / end node of each edge (global node indices, 0-based)
     pub edge_starts: Vec<usize>,
     pub edge_ends: Vec<usize>,
-    /// Global-node → free-index mapping  (usize::MAX if fixed)
-    pub node_to_free_idx: Vec<usize>,
+    /// Global-node → free-index mapping  (`None` if fixed)
+    pub node_to_free_idx: Vec<Option<usize>>,
 
     /// Cn  (ne × nn_free)  and  Cf  (ne × nn_fixed)  stored as CSC
     pub cn: CsMat<f64>,
@@ -512,9 +629,9 @@ impl FdmCache {
         }
 
         // ── 4. node_to_free_idx ───────────────────────────
-        let mut node_to_free_idx = vec![usize::MAX; nn];
+        let mut node_to_free_idx = vec![None; nn];
         for (i, &node) in topo.free_node_indices.iter().enumerate() {
-            node_to_free_idx[node] = i;
+            node_to_free_idx[node] = Some(i);
         }
 
         // ── 5. Factorisation strategy ─────────────────────
@@ -604,6 +721,9 @@ pub struct SolverResult {
     pub loss_trace: Vec<f64>,
     pub iterations: usize,
     pub converged: bool,
+    /// Maximum constraint violation (max of g⁺_k).  Zero when there are no
+    /// constraints.  For unconstrained solves this is always 0.0.
+    pub constraint_max_violation: f64,
 }
 
 // ─────────────────────────────────────────────────────────────

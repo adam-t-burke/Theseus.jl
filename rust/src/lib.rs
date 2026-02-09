@@ -19,3 +19,4 @@ pub mod optimizer;
 pub mod ffi;
 
 pub use types::TheseusError;
+pub use types::ObjectiveTrait;

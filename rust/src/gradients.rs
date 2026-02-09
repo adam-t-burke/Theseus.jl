@@ -9,7 +9,7 @@
 //! All gradients derived analytically — no AD framework needed.
 
 use crate::objectives::{softplus_grad, bounds_penalty_grad};
-use crate::types::{FdmCache, GeometrySnapshot, Objective, Problem, TheseusError};
+use crate::types::{Constraint, ALState, FdmCache, GeometrySnapshot, Problem, TheseusError};
 use ndarray::Array2;
 
 // ─────────────────────────────────────────────────────────────
@@ -53,8 +53,8 @@ pub fn accumulate_implicit_gradients(cache: &mut FdmCache, problem: &Problem) {
         let v_free = cache.node_to_free_idx[v];
 
         for d in 0..3 {
-            let lam_u = if u_free != usize::MAX { cache.lambda[[u_free, d]] } else { 0.0 };
-            let lam_v = if v_free != usize::MAX { cache.lambda[[v_free, d]] } else { 0.0 };
+            let lam_u = if let Some(uf) = u_free { cache.lambda[[uf, d]] } else { 0.0 };
+            let lam_v = if let Some(vf) = v_free { cache.lambda[[vf, d]] } else { 0.0 };
             let d_lam = lam_v - lam_u;
 
             let d_n = cache.nf[[v, d]] - cache.nf[[u, d]];
@@ -64,10 +64,10 @@ pub fn accumulate_implicit_gradients(cache: &mut FdmCache, problem: &Problem) {
 
             // ∂J/∂Nf  (fixed-node contributions)
             let term = -cache.q[k] * d_lam;
-            if v_free == usize::MAX {
+            if v_free.is_none() {
                 cache.grad_nf[[v, d]] += term;
             }
-            if u_free == usize::MAX {
+            if u_free.is_none() {
                 cache.grad_nf[[u, d]] -= term;
             }
         }
@@ -92,47 +92,7 @@ pub fn accumulate_explicit_gradients(
     // (grad_q will be zeroed in value_and_gradient before this is called)
 
     for obj in &problem.objectives {
-        match obj {
-            Objective::TargetXYZ { weight, node_indices, target } => {
-                grad_target_xyz(cache, *weight, node_indices, target, &problem.topology.free_node_indices);
-            }
-            Objective::TargetXY { weight, node_indices, target } => {
-                grad_target_xy(cache, *weight, node_indices, target, &problem.topology.free_node_indices);
-            }
-            Objective::TargetLength { weight, edge_indices, target } => {
-                grad_target_length(cache, *weight, edge_indices, target);
-            }
-            Objective::LengthVariation { weight, edge_indices, sharpness } => {
-                grad_length_variation(cache, *weight, edge_indices, *sharpness);
-            }
-            Objective::ForceVariation { weight, edge_indices, sharpness } => {
-                grad_force_variation(cache, *weight, edge_indices, *sharpness);
-            }
-            Objective::SumForceLength { weight, edge_indices } => {
-                grad_sum_force_length(cache, *weight, edge_indices);
-            }
-            Objective::MinLength { weight, edge_indices, threshold, sharpness } => {
-                grad_min_length(cache, *weight, edge_indices, threshold, *sharpness);
-            }
-            Objective::MaxLength { weight, edge_indices, threshold, sharpness } => {
-                grad_max_length(cache, *weight, edge_indices, threshold, *sharpness);
-            }
-            Objective::MinForce { weight, edge_indices, threshold, sharpness } => {
-                grad_min_force(cache, *weight, edge_indices, threshold, *sharpness);
-            }
-            Objective::MaxForce { weight, edge_indices, threshold, sharpness } => {
-                grad_max_force(cache, *weight, edge_indices, threshold, *sharpness);
-            }
-            Objective::RigidSetCompare { weight, node_indices, target } => {
-                grad_rigid_set_compare(cache, *weight, node_indices, target, &problem.topology.free_node_indices);
-            }
-            Objective::ReactionDirection { weight, anchor_indices, target_directions } => {
-                grad_reaction_direction(cache, problem, *weight, anchor_indices, target_directions);
-            }
-            Objective::ReactionDirectionMagnitude { weight, anchor_indices, target_directions, target_magnitudes } => {
-                grad_reaction_direction_magnitude(cache, problem, *weight, anchor_indices, target_directions, target_magnitudes);
-            }
-        }
+        obj.accumulate_gradient(cache, problem);
     }
 }
 
@@ -142,7 +102,7 @@ pub fn accumulate_explicit_gradients(
 
 /// TargetXYZ:  L = w Σ_i ‖xyz[idx] − t_i‖²
 /// dL/dx̂[j,d] = 2w (xyz[idx,d] − t[i,d])  if idx is a free node at position j
-fn grad_target_xyz(
+pub(crate) fn grad_target_xyz(
     cache: &mut FdmCache,
     weight: f64,
     node_indices: &[usize],
@@ -150,8 +110,7 @@ fn grad_target_xyz(
     _free_node_indices: &[usize],
 ) {
     for (i, &idx) in node_indices.iter().enumerate() {
-        let j = cache.node_to_free_idx[idx];
-        if j != usize::MAX {
+        if let Some(j) = cache.node_to_free_idx[idx] {
             for d in 0..3 {
                 cache.grad_x[[j, d]] += 2.0 * weight * (cache.nf[[idx, d]] - target[[i, d]]);
             }
@@ -161,7 +120,7 @@ fn grad_target_xyz(
 }
 
 /// TargetXY:  only x,y dimensions
-fn grad_target_xy(
+pub(crate) fn grad_target_xy(
     cache: &mut FdmCache,
     weight: f64,
     node_indices: &[usize],
@@ -169,8 +128,7 @@ fn grad_target_xy(
     _free_node_indices: &[usize],
 ) {
     for (i, &idx) in node_indices.iter().enumerate() {
-        let j = cache.node_to_free_idx[idx];
-        if j != usize::MAX {
+        if let Some(j) = cache.node_to_free_idx[idx] {
             for d in 0..2 {
                 cache.grad_x[[j, d]] += 2.0 * weight * (cache.nf[[idx, d]] - target[[i, d]]);
             }
@@ -182,7 +140,7 @@ fn grad_target_xy(
 /// dL/dx̂ via chain rule through ℓ_k = ‖ΔN_k‖
 ///   dℓ/dx̂[j,d] = ΔN_k[d] / ℓ_k  ×  (±1 depending on edge orientation)
 ///   dL/dx̂ += 2w (ℓ_k − t_k) · dℓ/dx̂
-fn grad_target_length(
+pub(crate) fn grad_target_length(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -201,11 +159,11 @@ fn grad_target_length(
 
         for d in 0..3 {
             let delta = cache.nf[[e, d]] - cache.nf[[s, d]];
-            if e_free != usize::MAX {
-                cache.grad_x[[e_free, d]] += scale * delta;
+            if let Some(ef) = e_free {
+                cache.grad_x[[ef, d]] += scale * delta;
             }
-            if s_free != usize::MAX {
-                cache.grad_x[[s_free, d]] -= scale * delta;
+            if let Some(sf) = s_free {
+                cache.grad_x[[sf, d]] -= scale * delta;
             }
         }
     }
@@ -223,7 +181,7 @@ fn softmax_weights(values: &[f64], edge_indices: &[usize], beta: f64) -> Vec<f64
 /// LengthVariation:  L = w (smooth_max(ℓ) − smooth_min(ℓ))
 ///   dL/dℓ_i = w (softmax_i(β ℓ) − softmax_i(−β ℓ))
 /// Then chain through ℓ → x̂.
-fn grad_length_variation(
+pub(crate) fn grad_length_variation(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -245,7 +203,7 @@ fn grad_length_variation(
 /// ForceVariation:  L = w (smooth_max(f) − smooth_min(f))
 ///   dL/df_i = w (softmax_i(β f) − softmax_i(−β f))
 /// Then chain through f → (x̂, q).
-fn grad_force_variation(
+pub(crate) fn grad_force_variation(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -265,7 +223,7 @@ fn grad_force_variation(
 /// SumForceLength:  L = w Σ ℓ_k · f_k = w Σ q_k ℓ_k²
 /// dL/dx̂ via ℓ_k:  2w q_k ℓ_k · dℓ_k/dx̂
 /// dL/dq_k = w ℓ_k²  (explicit)
-fn grad_sum_force_length(
+pub(crate) fn grad_sum_force_length(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -284,7 +242,7 @@ fn grad_sum_force_length(
 }
 
 /// MinLength barrier:  L = w Σ softplus(ℓ_k, threshold_k, −k_sharp)
-fn grad_min_length(
+pub(crate) fn grad_min_length(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -299,7 +257,7 @@ fn grad_min_length(
 }
 
 /// MaxLength barrier
-fn grad_max_length(
+pub(crate) fn grad_max_length(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -314,7 +272,7 @@ fn grad_max_length(
 }
 
 /// MinForce barrier:  chain through f_k = q_k ℓ_k
-fn grad_min_force(
+pub(crate) fn grad_min_force(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -329,7 +287,7 @@ fn grad_min_force(
 }
 
 /// MaxForce barrier
-fn grad_max_force(
+pub(crate) fn grad_max_force(
     cache: &mut FdmCache,
     weight: f64,
     edge_indices: &[usize],
@@ -344,7 +302,7 @@ fn grad_max_force(
 }
 
 /// RigidSetCompare:  L = w Σ_{i<j} (d_tgt − d_net)²
-fn grad_rigid_set_compare(
+pub(crate) fn grad_rigid_set_compare(
     cache: &mut FdmCache,
     weight: f64,
     node_indices: &[usize],
@@ -376,11 +334,11 @@ fn grad_rigid_set_compare(
             let fj = cache.node_to_free_idx[idx_j];
 
             for d in 0..3 {
-                if fi != usize::MAX {
-                    cache.grad_x[[fi, d]] += scale * delta[d];
+                if let Some(fi_val) = fi {
+                    cache.grad_x[[fi_val, d]] += scale * delta[d];
                 }
-                if fj != usize::MAX {
-                    cache.grad_x[[fj, d]] -= scale * delta[d];
+                if let Some(fj_val) = fj {
+                    cache.grad_x[[fj_val, d]] -= scale * delta[d];
                 }
             }
         }
@@ -394,7 +352,7 @@ fn grad_rigid_set_compare(
 /// This contribution flows through the adjoint automatically since reactions
 /// are computed from q and x̂.  We push dL/dReactions into grad_x via the
 /// chain rule.
-fn grad_reaction_direction(
+pub(crate) fn grad_reaction_direction(
     cache: &mut FdmCache,
     problem: &Problem,
     weight: f64,
@@ -426,7 +384,7 @@ fn grad_reaction_direction(
 }
 
 /// ReactionDirectionMagnitude:  adds magnitude penalty
-fn grad_reaction_direction_magnitude(
+pub(crate) fn grad_reaction_direction_magnitude(
     cache: &mut FdmCache,
     problem: &Problem,
     weight: f64,
@@ -480,11 +438,11 @@ fn add_length_grad_to_x(cache: &mut FdmCache, k: usize, dl_dl: f64) {
     for d in 0..3 {
         let delta = cache.nf[[e, d]] - cache.nf[[s, d]];
         let g = dl_dl * delta / len;
-        if e_free != usize::MAX {
-            cache.grad_x[[e_free, d]] += g;
+        if let Some(ef) = e_free {
+            cache.grad_x[[ef, d]] += g;
         }
-        if s_free != usize::MAX {
-            cache.grad_x[[s_free, d]] -= g;
+        if let Some(sf) = s_free {
+            cache.grad_x[[sf, d]] -= g;
         }
     }
 }
@@ -496,6 +454,41 @@ fn add_force_grad(cache: &mut FdmCache, k: usize, dl_df: f64) {
     cache.grad_q[k] += dl_df * cache.member_lengths[k];
     // dJ/dx̂ through ℓ
     add_length_grad_to_x(cache, k, dl_df * cache.q[k]);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Augmented Lagrangian constraint gradient
+// ─────────────────────────────────────────────────────────────
+
+/// Accumulate dJ_AL/dx̂ from all active inequality constraints into grad_x.
+///
+/// For each scalar constraint g_k = ℓ_k − L_max:
+///   if λ_k/μ + g_k > 0  (active):
+///     dJ_AL/dℓ_k = μ (λ_k/μ + g_k) = λ_k + μ g_k
+///     chain through dℓ/dx̂ via `add_length_grad_to_x`.
+pub fn accumulate_al_gradients(
+    cache: &mut FdmCache,
+    constraints: &[Constraint],
+    al: &ALState,
+) {
+    let mu = al.mu;
+    let mut idx = 0; // running index into al.lambdas
+    for c in constraints {
+        match c {
+            Constraint::MaxLength { edge_indices, max_lengths } => {
+                for (j, &k) in edge_indices.iter().enumerate() {
+                    let gk = cache.member_lengths[k] - max_lengths[j];
+                    let shifted = al.lambdas[idx] / mu + gk;
+                    if shifted > 0.0 {
+                        // dJ_AL/dℓ_k = max(0, λ_k + μ·g_k)
+                        let dl_dl = al.lambdas[idx] + mu * gk;
+                        add_length_grad_to_x(cache, k, dl_dl);
+                    }
+                    idx += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Chain dL/dR[node] through the reaction formula to dL/dx̂ and dL/dq.
@@ -536,11 +529,11 @@ fn accumulate_reaction_grad(
         let s_free = cache.node_to_free_idx[s];
         for d in 0..3 {
             let g = dl_dr[d] * sign * qi;
-            if e_free != usize::MAX {
-                cache.grad_x[[e_free, d]] += g;
+            if let Some(ef) = e_free {
+                cache.grad_x[[ef, d]] += g;
             }
-            if s_free != usize::MAX {
-                cache.grad_x[[s_free, d]] -= g;
+            if let Some(sf) = s_free {
+                cache.grad_x[[sf, d]] -= g;
             }
         }
     }
@@ -559,6 +552,7 @@ fn accumulate_reaction_grad(
 ///   2. Forward solve  → geometry snapshot
 ///   3. Evaluate total loss J
 ///   4. Accumulate explicit dJ/dx̂ from objectives
+///   4b. Accumulate AL constraint gradients (if present)
 ///   5. Adjoint solve  A λ = dJ/dx̂
 ///   6. Implicit dJ/dq  += −Δλ · ΔN
 ///   7. Barrier gradient on θ
@@ -572,6 +566,7 @@ pub fn value_and_gradient(
     ub: &[f64],
     lb_idx: &[usize],
     ub_idx: &[usize],
+    al: Option<&ALState>,
 ) -> Result<f64, TheseusError> {
     let ne = problem.topology.num_edges;
     let nvar = problem.anchors.variable_indices.len();
@@ -606,12 +601,23 @@ pub fn value_and_gradient(
     let barrier_loss = crate::objectives::bounds_penalty(
         theta, lb, ub, lb_idx, ub_idx, problem.solver.barrier_sharpness,
     );
-    let total = geometric_loss + barrier_loss * problem.solver.barrier_weight;
+    let al_loss = match al {
+        Some(al_state) => crate::objectives::al_penalty(
+            &problem.constraints, al_state, &cache.member_lengths,
+        ),
+        None => 0.0,
+    };
+    let total = geometric_loss + barrier_loss * problem.solver.barrier_weight + al_loss;
 
     // 4. Explicit gradients (fills grad_x, partial grad_q)
     cache.grad_q.fill(0.0);
     cache.grad_nf.fill(0.0);
     accumulate_explicit_gradients(cache, problem);
+
+    // 4b. AL constraint gradients
+    if let Some(al_state) = al {
+        accumulate_al_gradients(cache, &problem.constraints, al_state);
+    }
 
     // 5. Adjoint solve
     solve_adjoint(cache)?;

@@ -218,6 +218,7 @@ unsafe fn create_inner(
         fixed_node_positions,
         anchors,
         objectives: Vec::new(),
+        constraints: Vec::new(),
         bounds,
         solver: SolverOptions::default(),
     };
@@ -262,7 +263,7 @@ pub unsafe extern "C" fn theseus_add_target_xyz(
             (num_nodes, 3),
             slice::from_raw_parts(target_xyz, num_nodes * 3).to_vec(),
         ).map_err(|e| TheseusError::Shape(format!("target_xyz: {e}")))?;
-        h.problem.objectives.push(Objective::TargetXYZ { weight, node_indices: idx, target });
+        h.problem.objectives.push(Box::new(TargetXYZ { weight, node_indices: idx, target }));
         Ok(())
     }))
 }
@@ -283,7 +284,7 @@ pub unsafe extern "C" fn theseus_add_target_length(
         let h = &mut *handle;
         let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
         let tgt = slice::from_raw_parts(targets, num_edges).to_vec();
-        h.problem.objectives.push(Objective::TargetLength { weight, edge_indices: idx, target: tgt });
+        h.problem.objectives.push(Box::new(TargetLength { weight, edge_indices: idx, target: tgt }));
         Ok(())
     }))
 }
@@ -305,9 +306,9 @@ pub unsafe extern "C" fn theseus_add_min_length(
         let h = &mut *handle;
         let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
         let thr = slice::from_raw_parts(thresholds, num_edges).to_vec();
-        h.problem.objectives.push(Objective::MinLength {
+        h.problem.objectives.push(Box::new(MinLength {
             weight, edge_indices: idx, threshold: thr, sharpness,
-        });
+        }));
         Ok(())
     }))
 }
@@ -431,6 +432,114 @@ pub unsafe extern "C" fn theseus_solve_forward(
         }
         slice::from_raw_parts_mut(out_lengths, ne).copy_from_slice(&cache.member_lengths);
         slice::from_raw_parts_mut(out_forces, ne).copy_from_slice(&cache.member_forces);
+
+        Ok(())
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Constraint registration
+// ─────────────────────────────────────────────────────────────
+
+/// Add a MaxLength constraint (cable inextensibility).
+///
+/// Each selected edge is constrained to  ℓ_k ≤ max_length_k.
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_constraint_max_length(
+    handle: *mut TheseusHandle,
+    edge_indices: *const usize,
+    num_edges: usize,
+    max_lengths: *const f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        let ml = slice::from_raw_parts(max_lengths, num_edges).to_vec();
+        h.problem.constraints.push(Constraint::MaxLength {
+            edge_indices: idx,
+            max_lengths: ml,
+        });
+        Ok(())
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Constrained optimisation
+// ─────────────────────────────────────────────────────────────
+
+/// Run augmented Lagrangian constrained optimisation.
+///
+/// Solves a sequence of L-BFGS inner problems with an outer AL loop
+/// that drives constraint violations to zero.
+///
+/// Results are written into the same output buffers as `theseus_optimize`,
+/// with the addition of `out_max_violation` for the final constraint
+/// violation magnitude.
+///
+/// # Safety
+/// All output buffers must have the correct sizes.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_optimize_constrained(
+    handle: *mut TheseusHandle,
+    // ── AL settings ──
+    mu_init: f64,
+    mu_factor: f64,
+    mu_max: f64,
+    max_outer_iters: usize,
+    constraint_tol: f64,
+    // ── Output buffers ──
+    out_xyz: *mut f64,
+    out_lengths: *mut f64,
+    out_forces: *mut f64,
+    out_q: *mut f64,
+    out_reactions: *mut f64,
+    out_iterations: *mut usize,
+    out_converged: *mut bool,
+    out_max_violation: *mut f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+
+        let al_settings = ALSettings {
+            mu_init,
+            mu_factor,
+            mu_max,
+            max_outer_iters,
+            constraint_tol,
+        };
+
+        let result = optimizer::optimize_constrained(&h.problem, &mut h.state, &al_settings)?;
+
+        let nn = h.problem.topology.num_nodes;
+        let ne = h.problem.topology.num_edges;
+
+        // Copy xyz
+        let xyz_out = slice::from_raw_parts_mut(out_xyz, nn * 3);
+        for i in 0..nn {
+            for d in 0..3 {
+                xyz_out[i * 3 + d] = result.xyz[[i, d]];
+            }
+        }
+
+        // Copy lengths, forces, q
+        slice::from_raw_parts_mut(out_lengths, ne).copy_from_slice(&result.member_lengths);
+        slice::from_raw_parts_mut(out_forces, ne).copy_from_slice(&result.member_forces);
+        slice::from_raw_parts_mut(out_q, ne).copy_from_slice(&result.q);
+
+        // Copy reactions
+        let r_out = slice::from_raw_parts_mut(out_reactions, nn * 3);
+        for i in 0..nn {
+            for d in 0..3 {
+                r_out[i * 3 + d] = result.reactions[[i, d]];
+            }
+        }
+
+        *out_iterations = result.iterations;
+        *out_converged = result.converged;
+        *out_max_violation = result.constraint_max_violation;
 
         Ok(())
     }))

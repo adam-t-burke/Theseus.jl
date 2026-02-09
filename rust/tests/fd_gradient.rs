@@ -72,7 +72,7 @@ fn extract_columns(mat: &sprs::CsMat<f64>, cols: &[usize]) -> sprs::CsMat<f64> {
 ///
 /// Nodes 0, 6 are fixed anchors at ground level.
 /// Nodes 1–5 are free interior nodes.
-fn make_arch_problem(bounds: Bounds, objectives: Vec<Objective>) -> Problem {
+fn make_arch_problem(bounds: Bounds, objectives: Vec<Box<dyn ObjectiveTrait>>) -> Problem {
     let num_nodes = 7;
     let num_edges = 8;
 
@@ -138,6 +138,7 @@ fn make_arch_problem(bounds: Bounds, objectives: Vec<Objective>) -> Problem {
         fixed_node_positions,
         anchors,
         objectives,
+        constraints: Vec::new(),
         bounds,
         solver: SolverOptions::default(),
     }
@@ -153,7 +154,7 @@ fn eval_loss(problem: &Problem, theta: &[f64], lb: &[f64], ub: &[f64], lb_idx: &
     let mut cache = FdmCache::new(problem).unwrap();
     let mut grad = vec![0.0; theta.len()];
     theseus::gradients::value_and_gradient(
-        &mut cache, problem, theta, &mut grad, lb, ub, lb_idx, ub_idx,
+        &mut cache, problem, theta, &mut grad, lb, ub, lb_idx, ub_idx, None,
     ).unwrap()
 }
 
@@ -190,7 +191,7 @@ fn fd_gradient_check(
     let mut cache = FdmCache::new(problem).unwrap();
     let mut grad_analytic = vec![0.0; n];
     let _loss = theseus::gradients::value_and_gradient(
-        &mut cache, problem, theta, &mut grad_analytic, &lb, &ub, &lb_idx, &ub_idx,
+        &mut cache, problem, theta, &mut grad_analytic, &lb, &ub, &lb_idx, &ub_idx, None,
     ).unwrap();
 
     // FD gradient
@@ -285,11 +286,11 @@ fn fd_cholesky_target_xyz() {
     )
     .unwrap();
 
-    let objectives = vec![Objective::TargetXYZ {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(TargetXYZ {
         weight: 1.0,
         node_indices: vec![1, 2, 3, 4, 5],
         target,
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -311,11 +312,11 @@ fn fd_cholesky_target_length() {
         upper: vec![50.0; ne],
     };
 
-    let objectives = vec![Objective::TargetLength {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(TargetLength {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
         target: vec![1.0; ne],
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -337,10 +338,10 @@ fn fd_cholesky_sum_force_length() {
         upper: vec![f64::INFINITY; ne],
     };
 
-    let objectives = vec![Objective::SumForceLength {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(SumForceLength {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -374,21 +375,21 @@ fn fd_cholesky_combined() {
     )
     .unwrap();
 
-    let objectives = vec![
-        Objective::TargetXYZ {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![
+        Box::new(TargetXYZ {
             weight: 1.0,
             node_indices: vec![1, 2, 3, 4, 5],
             target: target_xyz,
-        },
-        Objective::TargetLength {
+        }),
+        Box::new(TargetLength {
             weight: 0.5,
             edge_indices: vec![0, 1, 2, 3, 4, 5],
             target: vec![1.5; 6],
-        },
-        Objective::SumForceLength {
+        }),
+        Box::new(SumForceLength {
             weight: 0.1,
             edge_indices: (0..ne).collect(),
-        },
+        }),
     ];
 
     let problem = make_arch_problem(bounds, objectives);
@@ -427,11 +428,11 @@ fn fd_ldl_target_xyz() {
     )
     .unwrap();
 
-    let objectives = vec![Objective::TargetXYZ {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(TargetXYZ {
         weight: 1.0,
         node_indices: vec![1, 2, 3, 4, 5],
         target,
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -454,11 +455,11 @@ fn fd_ldl_target_length() {
         upper: vec![10.0; ne],
     };
 
-    let objectives = vec![Objective::TargetLength {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(TargetLength {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
         target: vec![1.0; ne],
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -480,10 +481,10 @@ fn fd_ldl_sum_force_length() {
         upper: vec![10.0; ne],
     };
 
-    let objectives = vec![Objective::SumForceLength {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(SumForceLength {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -517,21 +518,21 @@ fn fd_ldl_combined() {
     )
     .unwrap();
 
-    let objectives = vec![
-        Objective::TargetXYZ {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![
+        Box::new(TargetXYZ {
             weight: 1.0,
             node_indices: vec![1, 2, 3, 4, 5],
             target: target_xyz,
-        },
-        Objective::TargetLength {
+        }),
+        Box::new(TargetLength {
             weight: 0.5,
             edge_indices: vec![0, 1, 2, 3, 4, 5],
             target: vec![1.5; 6],
-        },
-        Objective::SumForceLength {
+        }),
+        Box::new(SumForceLength {
             weight: 0.1,
             edge_indices: (0..ne).collect(),
-        },
+        }),
     ];
 
     let problem = make_arch_problem(bounds, objectives);
@@ -558,11 +559,11 @@ fn fd_cholesky_length_variation() {
         upper: vec![50.0; ne],
     };
 
-    let objectives = vec![Objective::LengthVariation {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(LengthVariation {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
         sharpness: 20.0,
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -584,11 +585,11 @@ fn fd_cholesky_force_variation() {
         upper: vec![50.0; ne],
     };
 
-    let objectives = vec![Objective::ForceVariation {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(ForceVariation {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
         sharpness: 20.0,
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -610,11 +611,11 @@ fn fd_ldl_length_variation() {
         upper: vec![10.0; ne],
     };
 
-    let objectives = vec![Objective::LengthVariation {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(LengthVariation {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
         sharpness: 20.0,
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -636,11 +637,11 @@ fn fd_ldl_force_variation() {
         upper: vec![10.0; ne],
     };
 
-    let objectives = vec![Objective::ForceVariation {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(ForceVariation {
         weight: 1.0,
         edge_indices: (0..ne).collect(),
         sharpness: 20.0,
-    }];
+    })];
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
@@ -674,22 +675,22 @@ fn fd_cholesky_combined_with_variation() {
     )
     .unwrap();
 
-    let objectives = vec![
-        Objective::TargetXYZ {
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![
+        Box::new(TargetXYZ {
             weight: 1.0,
             node_indices: vec![1, 2, 3, 4, 5],
             target: target_xyz,
-        },
-        Objective::LengthVariation {
+        }),
+        Box::new(LengthVariation {
             weight: 0.5,
             edge_indices: (0..ne).collect(),
             sharpness: 20.0,
-        },
-        Objective::ForceVariation {
+        }),
+        Box::new(ForceVariation {
             weight: 0.3,
             edge_indices: vec![0, 1, 2, 3, 4, 5],
             sharpness: 15.0,
-        },
+        }),
     ];
 
     let problem = make_arch_problem(bounds, objectives);
@@ -725,18 +726,20 @@ fn cholesky_ldl_consistency() {
     )
     .unwrap();
 
-    let objectives = vec![
-        Objective::TargetXYZ {
-            weight: 1.0,
-            node_indices: vec![1, 2, 3, 4, 5],
-            target: target.clone(),
-        },
-        Objective::TargetLength {
-            weight: 0.5,
-            edge_indices: (0..ne).collect(),
-            target: vec![1.0; ne],
-        },
-    ];
+    let make_objectives = || -> Vec<Box<dyn ObjectiveTrait>> {
+        vec![
+            Box::new(TargetXYZ {
+                weight: 1.0,
+                node_indices: vec![1, 2, 3, 4, 5],
+                target: target.clone(),
+            }),
+            Box::new(TargetLength {
+                weight: 0.5,
+                edge_indices: (0..ne).collect(),
+                target: vec![1.0; ne],
+            }),
+        ]
+    };
 
     let theta: Vec<f64> = vec![2.0, 3.0, 1.5, 2.5, 1.0, 3.5, 2.0, 1.8];
 
@@ -745,7 +748,7 @@ fn cholesky_ldl_consistency() {
         lower: vec![0.1; ne],
         upper: vec![100.0; ne],
     };
-    let problem_chol = make_arch_problem(bounds_chol, objectives.clone());
+    let problem_chol = make_arch_problem(bounds_chol, make_objectives());
     assert_eq!(
         FactorisationStrategy::from_bounds(&problem_chol.bounds),
         FactorisationStrategy::Cholesky,
@@ -756,7 +759,7 @@ fn cholesky_ldl_consistency() {
         lower: vec![-10.0; ne],
         upper: vec![100.0; ne],
     };
-    let problem_ldl = make_arch_problem(bounds_ldl, objectives);
+    let problem_ldl = make_arch_problem(bounds_ldl, make_objectives());
     assert_eq!(
         FactorisationStrategy::from_bounds(&problem_ldl.bounds),
         FactorisationStrategy::LDL,
@@ -777,14 +780,14 @@ fn cholesky_ldl_consistency() {
     let mut grad_chol = vec![0.0; ne];
     let _loss_chol = theseus::gradients::value_and_gradient(
         &mut cache_chol, &problem_chol, &theta, &mut grad_chol,
-        &lb_chol, &ub_chol, &lb_idx_chol, &ub_idx_chol,
+        &lb_chol, &ub_chol, &lb_idx_chol, &ub_idx_chol, None,
     ).unwrap();
 
     let mut cache_ldl = FdmCache::new(&problem_ldl).unwrap();
     let mut grad_ldl = vec![0.0; ne];
     let _loss_ldl = theseus::gradients::value_and_gradient(
         &mut cache_ldl, &problem_ldl, &theta, &mut grad_ldl,
-        &lb_ldl, &ub_ldl, &lb_idx_ldl, &ub_idx_ldl,
+        &lb_ldl, &ub_ldl, &lb_idx_ldl, &ub_idx_ldl, None,
     ).unwrap();
 
     // Positions should match (same q, same network)
@@ -850,3 +853,205 @@ fn strategy_zero_lower() {
     let b = Bounds { lower: vec![0.0, 0.0], upper: vec![10.0, 10.0] };
     assert_eq!(FactorisationStrategy::from_bounds(&b), FactorisationStrategy::LDL);
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Tests:  Augmented Lagrangian constraint gradient
+// ─────────────────────────────────────────────────────────────
+
+/// Evaluate loss with AL penalty at θ (fresh cache each call).
+fn eval_loss_al(
+    problem: &Problem,
+    theta: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    lb_idx: &[usize],
+    ub_idx: &[usize],
+    al: &ALState,
+) -> f64 {
+    let mut cache = FdmCache::new(problem).unwrap();
+    let mut grad = vec![0.0; theta.len()];
+    theseus::gradients::value_and_gradient(
+        &mut cache, problem, theta, &mut grad, lb, ub, lb_idx, ub_idx, Some(al),
+    ).unwrap()
+}
+
+/// Central-difference gradient test with AL penalty.
+fn fd_gradient_check_al(
+    problem: &Problem,
+    theta: &[f64],
+    al: &ALState,
+    h: f64,
+    tol_abs: f64,
+    tol_rel: f64,
+) {
+    let ne = problem.topology.num_edges;
+    let n = theta.len();
+
+    let lb: Vec<f64> = problem.bounds.lower.iter()
+        .chain(std::iter::repeat(&f64::NEG_INFINITY).take(n - ne))
+        .take(n)
+        .copied()
+        .collect();
+    let ub: Vec<f64> = problem.bounds.upper.iter()
+        .chain(std::iter::repeat(&f64::INFINITY).take(n - ne))
+        .take(n)
+        .copied()
+        .collect();
+    let lb_idx: Vec<usize> = (0..ne).filter(|&i| lb[i].is_finite()).collect();
+    let ub_idx: Vec<usize> = (0..ne).filter(|&i| ub[i].is_finite()).collect();
+
+    // Analytic gradient
+    let mut cache = FdmCache::new(problem).unwrap();
+    let mut grad_analytic = vec![0.0; n];
+    let _loss = theseus::gradients::value_and_gradient(
+        &mut cache, problem, theta, &mut grad_analytic, &lb, &ub, &lb_idx, &ub_idx, Some(al),
+    ).unwrap();
+
+    // FD gradient
+    let mut grad_fd = vec![0.0; n];
+    let mut theta_plus = theta.to_vec();
+    let mut theta_minus = theta.to_vec();
+
+    for i in 0..n {
+        theta_plus[i] = theta[i] + h;
+        theta_minus[i] = theta[i] - h;
+
+        let f_plus = eval_loss_al(problem, &theta_plus, &lb, &ub, &lb_idx, &ub_idx, al);
+        let f_minus = eval_loss_al(problem, &theta_minus, &lb, &ub, &lb_idx, &ub_idx, al);
+
+        grad_fd[i] = (f_plus - f_minus) / (2.0 * h);
+
+        theta_plus[i] = theta[i];
+        theta_minus[i] = theta[i];
+    }
+
+    // Compare
+    eprintln!("──────────────────────────────────────────────");
+    eprintln!("FD gradient check with AL  (h = {h:.1e})");
+    for i in 0..n {
+        let abs_err = (grad_analytic[i] - grad_fd[i]).abs();
+        let denom = grad_fd[i].abs().max(grad_analytic[i].abs()).max(1e-14);
+        let rel_err = abs_err / denom;
+        let tag = if i < ne { format!("q[{i}]") } else { format!("a[{}]", i - ne) };
+        let flag = if abs_err > tol_abs && rel_err > tol_rel { " <<<" } else { "" };
+        eprintln!(
+            "  {tag:>6}  analytic={:+12.6e}  fd={:+12.6e}  abs={:.2e}  rel={:.2e}{flag}",
+            grad_analytic[i], grad_fd[i], abs_err, rel_err,
+        );
+    }
+    eprintln!("──────────────────────────────────────────────");
+
+    for i in 0..n {
+        let abs_err = (grad_analytic[i] - grad_fd[i]).abs();
+        let denom = grad_fd[i].abs().max(grad_analytic[i].abs()).max(1e-14);
+        let rel_err = abs_err / denom;
+        assert!(
+            abs_err < tol_abs || rel_err < tol_rel,
+            "AL component {i}: analytic={:.8e}, fd={:.8e}, abs_err={:.3e}, rel_err={:.3e}",
+            grad_analytic[i], grad_fd[i], abs_err, rel_err,
+        );
+    }
+}
+
+/// MaxLength AL constraint — Cholesky path, initial μ (some constraints active).
+#[test]
+fn fd_al_max_length_cholesky() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![0.1; ne],
+        upper: vec![50.0; ne],
+    };
+
+    // Simple objective so the total loss isn't pure-constraint
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(SumForceLength {
+        weight: 0.1,
+        edge_indices: (0..ne).collect(),
+    })];
+
+    // Constraint: all edges ≤ 1.5 (will be violated at the test point)
+    let constraints = vec![Constraint::MaxLength {
+        edge_indices: (0..ne).collect(),
+        max_lengths: vec![1.5; ne],
+    }];
+
+    let mut problem = make_arch_problem(bounds, objectives);
+    problem.constraints = constraints;
+
+    // AL state with non-zero multipliers to exercise the gradient
+    let al = ALState {
+        lambdas: vec![1.0, 2.0, 0.5, 1.5, 3.0, 0.8, 1.2, 2.5],
+        mu: 100.0,
+    };
+
+    let theta: Vec<f64> = vec![2.0, 3.0, 1.5, 2.5, 1.0, 3.5, 2.0, 1.8];
+
+    fd_gradient_check_al(&problem, &theta, &al, 1e-6, 1e-4, 1e-3);
+}
+
+/// MaxLength AL constraint — LDL path with mixed bounds.
+#[test]
+fn fd_al_max_length_ldl() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![-10.0; ne],
+        upper: vec![10.0; ne],
+    };
+
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(TargetLength {
+        weight: 1.0,
+        edge_indices: (0..ne).collect(),
+        target: vec![1.0; ne],
+    })];
+
+    let constraints = vec![Constraint::MaxLength {
+        edge_indices: vec![0, 2, 4, 6],
+        max_lengths: vec![2.0, 1.8, 2.0, 1.8],
+    }];
+
+    let mut problem = make_arch_problem(bounds, objectives);
+    problem.constraints = constraints;
+
+    let al = ALState {
+        lambdas: vec![0.5, 1.0, 0.3, 2.0],
+        mu: 50.0,
+    };
+
+    let theta: Vec<f64> = vec![1.0, 2.0, 1.5, 2.5, 3.0, 1.2, 2.0, 1.8];
+
+    fd_gradient_check_al(&problem, &theta, &al, 1e-6, 1e-4, 1e-3);
+}
+
+/// MaxLength AL constraint at zero multipliers (pure penalty, no Lagrangian shift).
+#[test]
+fn fd_al_max_length_zero_lambda() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![0.1; ne],
+        upper: vec![50.0; ne],
+    };
+
+    let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(SumForceLength {
+        weight: 0.1,
+        edge_indices: (0..ne).collect(),
+    })];
+
+    let constraints = vec![Constraint::MaxLength {
+        edge_indices: (0..ne).collect(),
+        max_lengths: vec![1.5; ne],
+    }];
+
+    let mut problem = make_arch_problem(bounds, objectives);
+    problem.constraints = constraints;
+
+    // λ = 0 → pure quadratic penalty (first outer iteration)
+    let al = ALState {
+        lambdas: vec![0.0; ne],
+        mu: 10.0,
+    };
+
+    let theta: Vec<f64> = vec![2.0, 1.5, 3.0, 2.5, 1.0, 4.0, 2.0, 1.5];
+
+    fd_gradient_check_al(&problem, &theta, &al, 1e-6, 1e-4, 1e-3);
+}
+
+
