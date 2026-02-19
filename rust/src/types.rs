@@ -379,13 +379,13 @@ pub struct QToNz {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Factorisation strategy
+//  Factorization strategy
 // ─────────────────────────────────────────────────────────────
 
-/// Adaptive factorisation for A(q) = Cn^T diag(q) Cn.
+/// Adaptive factorization for A(q) = Cn^T diag(q) Cn.
 /// Cholesky when bounds guarantee sign-definiteness; LDL for mixed sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FactorisationStrategy {
+pub enum FactorizationStrategy {
     /// All q_k > 0  (or all < 0):  A is SPD → Cholesky.
     /// Uses AMD fill-in reduction for better sparsity in L.
     Cholesky,
@@ -393,7 +393,7 @@ pub enum FactorisationStrategy {
     LDL,
 }
 
-impl FactorisationStrategy {
+impl FactorizationStrategy {
     /// Choose strategy from the bounds on q.
     pub fn from_bounds(bounds: &Bounds) -> Self {
         let all_positive = bounds.lower.iter().all(|&lb| lb > 0.0);
@@ -429,9 +429,9 @@ impl std::fmt::Debug for Factorization {
 
 impl Factorization {
     /// Create an initial factorization from A and the chosen strategy.
-    pub fn new(a: sprs::CsMatView<f64>, strategy: FactorisationStrategy) -> Result<Self, sprs::errors::LinalgError> {
+    pub fn new(a: sprs::CsMatView<f64>, strategy: FactorizationStrategy) -> Result<Self, sprs::errors::LinalgError> {
         match strategy {
-            FactorisationStrategy::Cholesky => {
+            FactorizationStrategy::Cholesky => {
                 let ldl = Ldl::new()
                     .fill_in_reduction(FillInReduction::ReverseCuthillMcKee)
                     .check_symmetry(SymmetryCheck::DontCheckSymmetry)
@@ -449,7 +449,7 @@ impl Factorization {
                 }
                 Ok(Self::Cholesky(ldl))
             }
-            FactorisationStrategy::LDL => {
+            FactorizationStrategy::LDL => {
                 let ldl = Ldl::new()
                     .fill_in_reduction(FillInReduction::ReverseCuthillMcKee)
                     .check_symmetry(SymmetryCheck::DontCheckSymmetry)
@@ -491,10 +491,10 @@ impl Factorization {
     }
 
     /// The strategy this factorization was built with.
-    pub fn strategy(&self) -> FactorisationStrategy {
+    pub fn strategy(&self) -> FactorizationStrategy {
         match self {
-            Self::Cholesky(_) => FactorisationStrategy::Cholesky,
-            Self::Ldl(_) => FactorisationStrategy::LDL,
+            Self::Cholesky(_) => FactorizationStrategy::Cholesky,
+            Self::Ldl(_) => FactorizationStrategy::LDL,
         }
     }
 }
@@ -557,8 +557,8 @@ pub struct FdmCache {
     // ── RHS buffer (reusable for linear solve input) ───────
     pub rhs: Array2<f64>,      // nn_free × 3
 
-    // ── Factorisation ──────────────────────────────────────
-    pub strategy: FactorisationStrategy,
+    // ── Factorization ──────────────────────────────────────
+    pub strategy: FactorizationStrategy,
 }
 
 impl FdmCache {
@@ -634,8 +634,8 @@ impl FdmCache {
             node_to_free_idx[node] = Some(i);
         }
 
-        // ── 5. Factorisation strategy ─────────────────────
-        let strategy = FactorisationStrategy::from_bounds(&problem.bounds);
+        // ── 5. Factorization strategy ─────────────────────
+        let strategy = FactorizationStrategy::from_bounds(&problem.bounds);
 
         // ── 6. Pre-allocate all buffers ───────────────────
         let cf = topo.fixed_incidence.clone();

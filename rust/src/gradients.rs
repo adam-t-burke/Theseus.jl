@@ -2,7 +2,7 @@
 //!
 //! The adjoint method computes dJ/dq via:
 //!   1. Accumulate explicit dJ/dx̂ from each objective
-//!   2. Solve adjoint system A^T λ = dJ/dx̂  (reuse A factorisation)
+//!   2. Solve adjoint system A^T λ = dJ/dx̂  (reuse A Factorization)
 //!   3. Implicit gradient:  dJ/dq_k = −Δλ_k · ΔN_k
 //!   4. Add explicit dJ/dq_k terms (SumForceLength, barrier, etc.)
 //!
@@ -13,7 +13,7 @@ use crate::types::{Constraint, ALState, FdmCache, GeometrySnapshot, Problem, The
 use ndarray::Array2;
 
 // ─────────────────────────────────────────────────────────────
-//  Adjoint solve  (reuses LDL factorisation from forward solve)
+//  Adjoint solve  (reuses LDL Factorization from forward solve)
 // ─────────────────────────────────────────────────────────────
 
 /// Solve A λ = dJ/dx̂ for each coordinate column.

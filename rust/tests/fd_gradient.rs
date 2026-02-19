@@ -1,4 +1,4 @@
-//! Finite-difference gradient tests for both Cholesky and LDL factorisation
+//! Finite-difference gradient tests for both Cholesky and LDL Factorization
 //! paths.
 //!
 //! Tests build a 7-node arch network with **two fixed anchors** (nodes 0, 6)
@@ -10,8 +10,8 @@
 //!     dJ/dθ_i  ≈  [ J(θ + h eᵢ) − J(θ − h eᵢ) ] / 2h
 //!
 //! We verify both:
-//!   (a) FactorisationStrategy::Cholesky  (all q bounds > 0)
-//!   (b) FactorisationStrategy::LDL       (mixed sign q bounds)
+//!   (a) FactorizationStrategy::Cholesky  (all q bounds > 0)
+//!   (b) FactorizationStrategy::LDL       (mixed sign q bounds)
 //!
 //! Multiple objective types are exercised per test for coverage.
 
@@ -149,7 +149,7 @@ fn make_arch_problem(bounds: Bounds, objectives: Vec<Box<dyn ObjectiveTrait>>) -
 // ─────────────────────────────────────────────────────────────
 
 /// Evaluate loss-only at θ (without gradient — fresh cache each call so the
-/// factorisation is clean).
+/// Factorization is clean).
 fn eval_loss(problem: &Problem, theta: &[f64], lb: &[f64], ub: &[f64], lb_idx: &[usize], ub_idx: &[usize]) -> f64 {
     let mut cache = FdmCache::new(problem).unwrap();
     let mut grad = vec![0.0; theta.len()];
@@ -294,8 +294,8 @@ fn fd_cholesky_target_xyz() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     let theta: Vec<f64> = vec![2.0, 3.0, 1.5, 2.5, 1.0, 3.5, 2.0, 1.8];
@@ -320,8 +320,8 @@ fn fd_cholesky_target_length() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     let theta: Vec<f64> = vec![1.0, 2.0, 1.5, 2.5, 3.0, 1.2, 2.0, 1.8];
@@ -345,8 +345,8 @@ fn fd_cholesky_sum_force_length() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     let theta: Vec<f64> = vec![2.0, 1.5, 3.0, 2.5, 1.0, 4.0, 2.0, 1.5];
@@ -394,8 +394,8 @@ fn fd_cholesky_combined() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     let theta: Vec<f64> = vec![1.5, 2.0, 2.5, 3.0, 1.0, 1.5, 2.2, 1.8];
@@ -436,8 +436,8 @@ fn fd_ldl_target_xyz() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::LDL,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::LDL,
     );
 
     // Positive q values (A is SPD at this point even under LDL strategy)
@@ -463,8 +463,8 @@ fn fd_ldl_target_length() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::LDL,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::LDL,
     );
 
     let theta: Vec<f64> = vec![1.0, 2.0, 1.5, 2.5, 3.0, 1.2, 2.0, 1.8];
@@ -488,8 +488,8 @@ fn fd_ldl_sum_force_length() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::LDL,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::LDL,
     );
 
     let theta: Vec<f64> = vec![2.0, 1.5, 3.0, 2.5, 1.0, 4.0, 2.0, 1.5];
@@ -537,8 +537,8 @@ fn fd_ldl_combined() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::LDL,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::LDL,
     );
 
     let theta: Vec<f64> = vec![1.5, 2.0, 2.5, 3.0, 1.0, 1.5, 2.2, 1.8];
@@ -567,8 +567,8 @@ fn fd_cholesky_length_variation() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     let theta: Vec<f64> = vec![1.0, 2.0, 1.5, 2.5, 3.0, 1.2, 2.0, 1.8];
@@ -593,8 +593,8 @@ fn fd_cholesky_force_variation() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     let theta: Vec<f64> = vec![2.0, 3.0, 1.5, 2.5, 1.0, 3.5, 2.0, 1.8];
@@ -619,8 +619,8 @@ fn fd_ldl_length_variation() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::LDL,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::LDL,
     );
 
     let theta: Vec<f64> = vec![1.0, 2.0, 1.5, 2.5, 3.0, 1.2, 2.0, 1.8];
@@ -645,8 +645,8 @@ fn fd_ldl_force_variation() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::LDL,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::LDL,
     );
 
     let theta: Vec<f64> = vec![2.0, 1.5, 3.0, 2.5, 1.0, 4.0, 2.0, 1.5];
@@ -695,8 +695,8 @@ fn fd_cholesky_combined_with_variation() {
 
     let problem = make_arch_problem(bounds, objectives);
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     let theta: Vec<f64> = vec![1.5, 2.0, 2.5, 3.0, 1.0, 1.5, 2.2, 1.8];
@@ -750,8 +750,8 @@ fn cholesky_ldl_consistency() {
     };
     let problem_chol = make_arch_problem(bounds_chol, make_objectives());
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem_chol.bounds),
-        FactorisationStrategy::Cholesky,
+        FactorizationStrategy::from_bounds(&problem_chol.bounds),
+        FactorizationStrategy::Cholesky,
     );
 
     // LDL problem
@@ -761,8 +761,8 @@ fn cholesky_ldl_consistency() {
     };
     let problem_ldl = make_arch_problem(bounds_ldl, make_objectives());
     assert_eq!(
-        FactorisationStrategy::from_bounds(&problem_ldl.bounds),
-        FactorisationStrategy::LDL,
+        FactorizationStrategy::from_bounds(&problem_ldl.bounds),
+        FactorizationStrategy::LDL,
     );
 
     // Evaluate both
@@ -827,31 +827,31 @@ fn cholesky_ldl_consistency() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Factorisation strategy dispatch tests
+//  Factorization strategy dispatch tests
 // ─────────────────────────────────────────────────────────────
 
 #[test]
 fn strategy_all_positive() {
     let b = Bounds { lower: vec![0.1, 0.5], upper: vec![10.0, 20.0] };
-    assert_eq!(FactorisationStrategy::from_bounds(&b), FactorisationStrategy::Cholesky);
+    assert_eq!(FactorizationStrategy::from_bounds(&b), FactorizationStrategy::Cholesky);
 }
 
 #[test]
 fn strategy_all_negative() {
     let b = Bounds { lower: vec![-10.0, -5.0], upper: vec![-0.1, -0.5] };
-    assert_eq!(FactorisationStrategy::from_bounds(&b), FactorisationStrategy::Cholesky);
+    assert_eq!(FactorizationStrategy::from_bounds(&b), FactorizationStrategy::Cholesky);
 }
 
 #[test]
 fn strategy_mixed() {
     let b = Bounds { lower: vec![-1.0, 0.1], upper: vec![1.0, 5.0] };
-    assert_eq!(FactorisationStrategy::from_bounds(&b), FactorisationStrategy::LDL);
+    assert_eq!(FactorizationStrategy::from_bounds(&b), FactorizationStrategy::LDL);
 }
 
 #[test]
 fn strategy_zero_lower() {
     let b = Bounds { lower: vec![0.0, 0.0], upper: vec![10.0, 10.0] };
-    assert_eq!(FactorisationStrategy::from_bounds(&b), FactorisationStrategy::LDL);
+    assert_eq!(FactorizationStrategy::from_bounds(&b), FactorizationStrategy::LDL);
 }
 
 // ─────────────────────────────────────────────────────────────
