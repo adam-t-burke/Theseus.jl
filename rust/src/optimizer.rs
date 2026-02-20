@@ -42,6 +42,8 @@ struct FdmProblem<'a> {
     al: Option<ALState>,
     /// Cached (θ, loss, gradient) from the last evaluation.
     last_eval: RefCell<Option<(Vec<f64>, f64, Vec<f64>)>>,
+    /// Loss value recorded at each unique evaluation.
+    loss_trace: RefCell<Vec<f64>>,
 }
 
 impl<'a> FdmProblem<'a> {
@@ -71,6 +73,7 @@ impl<'a> FdmProblem<'a> {
             &self.ub_idx,
             self.al.as_ref(),
         ).map_err(|e| argmin::core::Error::msg(e.to_string()))?;
+        self.loss_trace.borrow_mut().push(val);
         *self.last_eval.borrow_mut() = Some((theta.to_vec(), val, grad));
         Ok(())
     }
@@ -181,6 +184,7 @@ pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<Solv
         ub_idx,
         al: None,
         last_eval: RefCell::new(None),
+        loss_trace: RefCell::new(Vec::new()),
     };
 
     // Configure L-BFGS
@@ -196,6 +200,10 @@ pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<Solv
         });
 
     let result = executor.run()?;
+    let loss_trace = result.problem.problem
+        .as_ref()
+        .map(|p| p.loss_trace.borrow().clone())
+        .unwrap_or_default();
 
     // Extract solution
     let best_param = result.state().get_best_param()
@@ -215,6 +223,7 @@ pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<Solv
     state.force_densities = q.clone();
     state.variable_anchor_positions = anchors.clone();
     state.iterations = result.state().get_iter() as usize;
+    state.loss_trace = loss_trace.clone();
 
     Ok(SolverResult {
         q,
@@ -223,7 +232,7 @@ pub fn optimize(problem: &Problem, state: &mut OptimizationState) -> Result<Solv
         member_lengths: final_cache.member_lengths,
         member_forces: final_cache.member_forces,
         reactions: final_cache.reactions,
-        loss_trace: Vec::new(), // TODO: collect via observer
+        loss_trace,
         iterations: state.iterations,
         converged,
         constraint_max_violation: 0.0,
@@ -257,6 +266,7 @@ fn inner_lbfgs(
         ub_idx,
         al,
         last_eval: RefCell::new(None),
+        loss_trace: RefCell::new(Vec::new()),
     };
 
     let linesearch = MoreThuenteLineSearch::new();

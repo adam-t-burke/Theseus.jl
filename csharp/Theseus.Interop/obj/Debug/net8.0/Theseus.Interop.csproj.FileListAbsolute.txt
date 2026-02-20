@@ -1,0 +1,12 @@
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\bin\Debug\net8.0\Theseus.Interop.deps.json
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\bin\Debug\net8.0\Theseus.Interop.dll
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\bin\Debug\net8.0\Theseus.Interop.pdb
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\Theseus.Interop.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\Theseus.Interop.AssemblyInfoInputs.cache
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\Theseus.Interop.AssemblyInfo.cs
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\Theseus.Interop.csproj.CoreCompileInputs.cache
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\Theseus.Interop.sourcelink.json
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\Theseus.Interop.dll
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\refint\Theseus.Interop.dll
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\Theseus.Interop.pdb
+C:\Users\aburke3\Documents\GitHub\Theseus.jl\csharp\Theseus.Interop\obj\Debug\net8.0\ref\Theseus.Interop.dll

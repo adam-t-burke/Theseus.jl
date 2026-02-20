@@ -313,6 +313,257 @@ pub unsafe extern "C" fn theseus_add_min_length(
     }))
 }
 
+/// Add a TargetXY objective (XY plane only).  Returns 0 on success.
+///
+/// `target_xy` is a flat row-major `num_nodes × 3` array (Z column is ignored
+/// by the loss but must be present for uniform layout).
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_target_xy(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    node_indices: *const usize,
+    num_nodes: usize,
+    target_xy: *const f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(node_indices, num_nodes).to_vec();
+        let target = Array2::from_shape_vec(
+            (num_nodes, 3),
+            slice::from_raw_parts(target_xy, num_nodes * 3).to_vec(),
+        ).map_err(|e| TheseusError::Shape(format!("target_xy: {e}")))?;
+        h.problem.objectives.push(Box::new(TargetXY { weight, node_indices: idx, target }));
+        Ok(())
+    }))
+}
+
+/// Add a LengthVariation objective (minimise range of edge lengths).
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_length_variation(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    edge_indices: *const usize,
+    num_edges: usize,
+    sharpness: f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        h.problem.objectives.push(Box::new(LengthVariation {
+            weight, edge_indices: idx, sharpness,
+        }));
+        Ok(())
+    }))
+}
+
+/// Add a ForceVariation objective (minimise range of member forces).
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_force_variation(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    edge_indices: *const usize,
+    num_edges: usize,
+    sharpness: f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        h.problem.objectives.push(Box::new(ForceVariation {
+            weight, edge_indices: idx, sharpness,
+        }));
+        Ok(())
+    }))
+}
+
+/// Add a SumForceLength objective (minimise Σ |f_k| × ℓ_k).
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_sum_force_length(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    edge_indices: *const usize,
+    num_edges: usize,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        h.problem.objectives.push(Box::new(SumForceLength {
+            weight, edge_indices: idx,
+        }));
+        Ok(())
+    }))
+}
+
+/// Add a MaxLength barrier objective (penalty for edges exceeding threshold).
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_max_length(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    edge_indices: *const usize,
+    num_edges: usize,
+    thresholds: *const f64,
+    sharpness: f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        let thr = slice::from_raw_parts(thresholds, num_edges).to_vec();
+        h.problem.objectives.push(Box::new(MaxLength {
+            weight, edge_indices: idx, threshold: thr, sharpness,
+        }));
+        Ok(())
+    }))
+}
+
+/// Add a MinForce barrier objective (penalty for forces below threshold).
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_min_force(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    edge_indices: *const usize,
+    num_edges: usize,
+    thresholds: *const f64,
+    sharpness: f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        let thr = slice::from_raw_parts(thresholds, num_edges).to_vec();
+        h.problem.objectives.push(Box::new(MinForce {
+            weight, edge_indices: idx, threshold: thr, sharpness,
+        }));
+        Ok(())
+    }))
+}
+
+/// Add a MaxForce barrier objective (penalty for forces exceeding threshold).
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_max_force(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    edge_indices: *const usize,
+    num_edges: usize,
+    thresholds: *const f64,
+    sharpness: f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(edge_indices, num_edges).to_vec();
+        let thr = slice::from_raw_parts(thresholds, num_edges).to_vec();
+        h.problem.objectives.push(Box::new(MaxForce {
+            weight, edge_indices: idx, threshold: thr, sharpness,
+        }));
+        Ok(())
+    }))
+}
+
+/// Add a RigidSetCompare objective (compare pairwise distances of a node set
+/// against target positions).
+///
+/// `target_xyz` is a flat row-major `num_nodes × 3` array.
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_rigid_set_compare(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    node_indices: *const usize,
+    num_nodes: usize,
+    target_xyz: *const f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(node_indices, num_nodes).to_vec();
+        let target = Array2::from_shape_vec(
+            (num_nodes, 3),
+            slice::from_raw_parts(target_xyz, num_nodes * 3).to_vec(),
+        ).map_err(|e| TheseusError::Shape(format!("rigid_set target: {e}")))?;
+        h.problem.objectives.push(Box::new(RigidSetCompare { weight, node_indices: idx, target }));
+        Ok(())
+    }))
+}
+
+/// Add a ReactionDirection objective (align anchor reaction directions).
+///
+/// `target_dirs` is a flat row-major `num_anchors × 3` array of unit vectors.
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_reaction_direction(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    anchor_indices: *const usize,
+    num_anchors: usize,
+    target_dirs: *const f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(anchor_indices, num_anchors).to_vec();
+        let dirs = Array2::from_shape_vec(
+            (num_anchors, 3),
+            slice::from_raw_parts(target_dirs, num_anchors * 3).to_vec(),
+        ).map_err(|e| TheseusError::Shape(format!("reaction_direction targets: {e}")))?;
+        h.problem.objectives.push(Box::new(ReactionDirection {
+            weight, anchor_indices: idx, target_directions: dirs,
+        }));
+        Ok(())
+    }))
+}
+
+/// Add a ReactionDirectionMagnitude objective (align anchor reactions in both
+/// direction and magnitude).
+///
+/// `target_dirs` is a flat row-major `num_anchors × 3` array of unit vectors.
+/// `target_mags` is a flat `num_anchors`-element array of target magnitudes.
+///
+/// # Safety
+/// Valid handle and arrays.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_add_reaction_direction_magnitude(
+    handle: *mut TheseusHandle,
+    weight: f64,
+    anchor_indices: *const usize,
+    num_anchors: usize,
+    target_dirs: *const f64,
+    target_mags: *const f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let idx = slice::from_raw_parts(anchor_indices, num_anchors).to_vec();
+        let dirs = Array2::from_shape_vec(
+            (num_anchors, 3),
+            slice::from_raw_parts(target_dirs, num_anchors * 3).to_vec(),
+        ).map_err(|e| TheseusError::Shape(format!("reaction_dir_mag targets: {e}")))?;
+        let mags = slice::from_raw_parts(target_mags, num_anchors).to_vec();
+        h.problem.objectives.push(Box::new(ReactionDirectionMagnitude {
+            weight, anchor_indices: idx, target_directions: dirs, target_magnitudes: mags,
+        }));
+        Ok(())
+    }))
+}
+
 /// Configure solver options.  Returns 0 on success.
 ///
 /// # Safety

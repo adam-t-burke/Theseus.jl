@@ -1,0 +1,102 @@
+name: Rust
+
+on:
+  push:
+    branches: [master, rust-port]
+    paths: ['rust/**', '.github/workflows/rust.yml']
+  pull_request:
+    paths: ['rust/**', '.github/workflows/rust.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build (debug)
+        run: cargo build
+
+      - name: Run tests (excluding benchmarks)
+        run: cargo test --test integration --test fd_gradient --test ffi_roundtrip
+
+      - name: Build release DLL
+        run: cargo build --release
+
+      - name: Verify DLL exists (Windows)
+        if: runner.os == 'Windows'
+        run: Test-Path target/release/theseus.dll
+        shell: pwsh
+
+      - name: Verify .so exists (Linux)
+        if: runner.os == 'Linux'
+        run: test -f target/release/libtheseus.so
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: theseus-${{ runner.os }}
+          path: |
+            rust/target/release/theseus.dll
+            rust/target/release/theseus.dll.lib
+            rust/target/release/libtheseus.so
+          if-no-files-found: ignore
+
+  csharp-smoke-test:
+    name: C# smoke test
+    runs-on: windows-latest
+    needs: test
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows DLL
+        uses: actions/download-artifact@v4
+        with:
+          name: theseus-Windows
+          path: native
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build C# projects
+        run: dotnet build csharp/Theseus.Tests/Theseus.Tests.csproj
+
+      - name: Copy native DLL
+        run: |
+          Copy-Item native/theseus.dll csharp/Theseus.Tests/bin/Debug/net8.0/theseus.dll
+        shell: pwsh
+
+      - name: Run C# smoke tests
+        run: dotnet run --project csharp/Theseus.Tests/Theseus.Tests.csproj --no-build
