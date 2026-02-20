@@ -5,6 +5,23 @@ import ADTypes
 import DifferentiationInterface
 using TimerOutputs
 
+"""
+    evaluate_geometry(problem, q, anchor_positions, cache) -> GeometrySnapshot
+
+Compute the equilibrium geometry for given force densities using the Force Density Method.
+
+Solves the FDM linear system, then computes member lengths, forces, and reaction forces.
+Results are stored in `cache` and returned as a [`GeometrySnapshot`](@ref).
+
+# Arguments
+- `problem::OptimizationProblem`: The problem definition
+- `q::AbstractVector{<:Real}`: Force density values for each edge
+- `anchor_positions::AbstractMatrix{<:Real}`: Current positions of variable anchors
+- `cache::OptimizationCache`: Pre-allocated buffers for the solver
+
+# Returns
+A `GeometrySnapshot` containing node positions, member lengths/forces, and reactions.
+"""
 function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::OptimizationCache)
     # In-place update of cache buffers
     solve_FDM!(cache, q, problem, anchor_positions)
@@ -165,6 +182,30 @@ function parameter_bounds(problem::OptimizationProblem)
     lower, upper
 end
 
+"""
+    optimize_problem!(problem, state; on_iteration=nothing) -> (result, snapshot)
+
+Run L-BFGS optimization to minimize the objective functions.
+
+Uses automatic differentiation via Mooncake.jl to compute gradients efficiently.
+The optimization modifies `state` in-place, updating force densities and recording
+the loss history.
+
+# Arguments
+- `problem::OptimizationProblem`: Problem definition with objectives and constraints
+- `state::OptimizationState`: Mutable state with initial force densities
+
+# Keyword Arguments
+- `on_iteration`: Optional callback `(state, snapshot, loss) -> nothing` called each iteration
+
+# Returns
+- `result`: Optim.jl optimization result object
+- `snapshot::GeometrySnapshot`: Final geometry state
+
+# Notes
+Barrier functions are used for bound constraints rather than projected gradients,
+allowing smooth gradients for the autodiff system.
+"""
 function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
     # Ensure cache is initialized
     if isnothing(state.cache)

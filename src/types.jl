@@ -5,41 +5,125 @@ using TimerOutputs
 
 const DEFAULT_BARRIER_SHARPNESS = 10.0
 
+"""
+    AbstractObjective
+
+Abstract supertype for all optimization objectives in Theseus.
+
+Concrete subtypes define specific optimization goals such as target positions,
+length constraints, force constraints, and reaction force objectives. Each objective
+type has a `weight` field that controls its relative importance in the total loss function.
+
+See also: [`TargetXYZObjective`](@ref), [`TargetLengthObjective`](@ref), [`MinLengthObjective`](@ref)
+"""
 abstract type AbstractObjective end
 
+"""
+    TargetXYZObjective <: AbstractObjective
+
+Objective that penalizes deviation of free nodes from target 3D positions.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective in the total loss
+- `node_indices::Vector{Int}`: Indices of nodes to constrain
+- `target::Matrix{Float64}`: Target positions as an N×3 matrix (x, y, z per row)
+
+This is the primary objective for form-finding when you want nodes to reach
+specific spatial positions.
+"""
 Base.@kwdef struct TargetXYZObjective <: AbstractObjective
     weight::Float64
     node_indices::Vector{Int}
     target::Matrix{Float64}
 end
 
+"""
+    TargetXYObjective <: AbstractObjective
+
+Objective that penalizes deviation of free nodes from target XY positions (ignoring Z).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `node_indices::Vector{Int}`: Indices of nodes to constrain
+- `target::Matrix{Float64}`: Target positions as an N×3 matrix (only x, y used)
+
+Useful for planar constraints where vertical position should be determined by equilibrium.
+"""
 Base.@kwdef struct TargetXYObjective <: AbstractObjective
     weight::Float64
     node_indices::Vector{Int}
     target::Matrix{Float64}
 end
 
+"""
+    TargetLengthObjective <: AbstractObjective
+
+Objective that penalizes deviation of member lengths from target values.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `target::Vector{Float64}`: Target length for each edge
+"""
 Base.@kwdef struct TargetLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
     target::Vector{Float64}
 end
 
+"""
+    LengthVariationObjective <: AbstractObjective
+
+Objective that minimizes variance in member lengths (promotes uniformity).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to consider
+"""
 Base.@kwdef struct LengthVariationObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
 end
 
+"""
+    ForceVariationObjective <: AbstractObjective
+
+Objective that minimizes variance in member forces (promotes uniform stress).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to consider
+"""
 Base.@kwdef struct ForceVariationObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
 end
 
+"""
+    SumForceLengthObjective <: AbstractObjective
+
+Objective that minimizes the sum of force times length (related to structural volume).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to consider
+"""
 Base.@kwdef struct SumForceLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
 end
 
+"""
+    MinLengthObjective <: AbstractObjective
+
+Soft constraint enforcing minimum member lengths using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Minimum allowed length for each edge
+- `sharpness::Float64`: Barrier sharpness (higher = steeper penalty near threshold)
+"""
 Base.@kwdef struct MinLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -47,6 +131,17 @@ Base.@kwdef struct MinLengthObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    MaxLengthObjective <: AbstractObjective
+
+Soft constraint enforcing maximum member lengths using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Maximum allowed length for each edge
+- `sharpness::Float64`: Barrier sharpness (higher = steeper penalty near threshold)
+"""
 Base.@kwdef struct MaxLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -54,6 +149,17 @@ Base.@kwdef struct MaxLengthObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    MinForceObjective <: AbstractObjective
+
+Soft constraint enforcing minimum member forces using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Minimum allowed force for each edge
+- `sharpness::Float64`: Barrier sharpness
+"""
 Base.@kwdef struct MinForceObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -61,6 +167,17 @@ Base.@kwdef struct MinForceObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    MaxForceObjective <: AbstractObjective
+
+Soft constraint enforcing maximum member forces using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Maximum allowed force for each edge
+- `sharpness::Float64`: Barrier sharpness
+"""
 Base.@kwdef struct MaxForceObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -68,18 +185,49 @@ Base.@kwdef struct MaxForceObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    RigidSetCompareObjective <: AbstractObjective
+
+Objective that compares node positions to a rigid reference shape, allowing rotation and translation.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `node_indices::Vector{Int}`: Indices of nodes in the set
+- `target::Matrix{Float64}`: Reference shape positions
+"""
 Base.@kwdef struct RigidSetCompareObjective <: AbstractObjective
     weight::Float64
     node_indices::Vector{Int}
     target::Matrix{Float64}
 end
 
+"""
+    ReactionDirectionObjective <: AbstractObjective
+
+Objective that penalizes deviation of anchor reaction forces from target directions.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `anchor_indices::Vector{Int}`: Indices of anchor nodes
+- `target_directions::Matrix{Float64}`: Unit direction vectors (N×3 matrix)
+"""
 Base.@kwdef struct ReactionDirectionObjective <: AbstractObjective
     weight::Float64
     anchor_indices::Vector{Int}
     target_directions::Matrix{Float64}
 end
 
+"""
+    ReactionDirectionMagnitudeObjective <: AbstractObjective
+
+Objective that penalizes deviation of anchor reactions from target directions AND magnitudes.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `anchor_indices::Vector{Int}`: Indices of anchor nodes
+- `target_directions::Matrix{Float64}`: Unit direction vectors (N×3 matrix)
+- `target_magnitudes::Vector{Float64}`: Target force magnitudes
+"""
 Base.@kwdef struct ReactionDirectionMagnitudeObjective <: AbstractObjective
     weight::Float64
     anchor_indices::Vector{Int}
@@ -87,11 +235,38 @@ Base.@kwdef struct ReactionDirectionMagnitudeObjective <: AbstractObjective
     target_magnitudes::Vector{Float64}
 end
 
+"""
+    Bounds
+
+Box constraints on force density variables.
+
+# Fields
+- `lower::Vector{Float64}`: Lower bounds for each force density
+- `upper::Vector{Float64}`: Upper bounds for each force density
+
+Force densities are constrained to be positive by default (lower bound ~1e-8)
+to ensure tension-only or compression-only behavior.
+"""
 struct Bounds
     lower::Vector{Float64}
     upper::Vector{Float64}
 end
 
+"""
+    SolverOptions
+
+Configuration for the L-BFGS optimization solver.
+
+# Fields
+- `absolute_tolerance::Float64`: Absolute convergence tolerance
+- `relative_tolerance::Float64`: Relative convergence tolerance
+- `max_iterations::Int`: Maximum number of iterations
+- `report_frequency::Int`: How often to report progress
+- `show_progress::Bool`: Whether to print iteration info
+- `barrier_weight::Float64`: Weight for barrier penalty terms
+- `barrier_sharpness::Float64`: Sharpness of barrier functions
+- `use_auto_scaling::Bool`: Whether to auto-scale the problem
+"""
 Base.@kwdef struct SolverOptions
     absolute_tolerance::Float64
     relative_tolerance::Float64
@@ -103,11 +278,31 @@ Base.@kwdef struct SolverOptions
     use_auto_scaling::Bool
 end
 
+"""
+    TracingOptions
+
+Options for recording optimization history.
+
+# Fields
+- `record_nodes::Bool`: Whether to record node positions at each iteration
+- `emit_frequency::Int`: How often to emit intermediate results via WebSocket
+"""
 Base.@kwdef struct TracingOptions
     record_nodes::Bool
     emit_frequency::Int
 end
 
+"""
+    OptimizationParameters
+
+Complete specification of the optimization problem parameters.
+
+# Fields
+- `objectives::Vector{AbstractObjective}`: List of objective functions to minimize
+- `bounds::Bounds`: Box constraints on force densities
+- `solver::SolverOptions`: Solver configuration
+- `tracing::TracingOptions`: History recording options
+"""
 Base.@kwdef struct OptimizationParameters
     objectives::Vector{AbstractObjective}
     bounds::Bounds
@@ -115,6 +310,22 @@ Base.@kwdef struct OptimizationParameters
     tracing::TracingOptions
 end
 
+"""
+    NetworkTopology
+
+Graph structure of the cable/strut network.
+
+# Fields
+- `incidence::SparseMatrixCSC{Int,Int}`: Full edge-node incidence matrix (ne × nn)
+- `free_incidence::SparseMatrixCSC{Int,Int}`: Incidence for free nodes only
+- `fixed_incidence::SparseMatrixCSC{Int,Int}`: Incidence for fixed/anchor nodes only
+- `num_edges::Int`: Total number of edges (members)
+- `num_nodes::Int`: Total number of nodes
+- `free_node_indices::Vector{Int}`: Indices of nodes that can move
+- `fixed_node_indices::Vector{Int}`: Indices of anchor/support nodes
+
+The incidence matrix has +1 for edge end nodes and -1 for edge start nodes.
+"""
 struct NetworkTopology
     incidence::SparseMatrixCSC{Int, Int}
     free_incidence::SparseMatrixCSC{Int, Int}
@@ -125,14 +336,41 @@ struct NetworkTopology
     fixed_node_indices::Vector{Int}
 end
 
+"""
+    LoadData
+
+External loads applied to free nodes.
+
+# Fields
+- `free_node_loads::Matrix{Float64}`: Load vectors as an N×3 matrix (fx, fy, fz per row)
+"""
 struct LoadData
     free_node_loads::Matrix{Float64}
 end
 
+"""
+    GeometryData
+
+Fixed node (anchor) positions.
+
+# Fields
+- `fixed_node_positions::Matrix{Float64}`: Anchor positions as an N×3 matrix
+"""
 struct GeometryData
     fixed_node_positions::Matrix{Float64}
 end
 
+"""
+    AnchorInfo
+
+Information about anchor nodes, including which can vary during optimization.
+
+# Fields
+- `variable_indices::Vector{Int}`: Indices of anchors that can move during optimization
+- `fixed_indices::Vector{Int}`: Indices of anchors with fixed positions
+- `reference_positions::Matrix{Float64}`: Reference positions for all anchors
+- `initial_variable_positions::Matrix{Float64}`: Starting positions for variable anchors
+"""
 Base.@kwdef struct AnchorInfo
     variable_indices::Vector{Int}
     fixed_indices::Vector{Int}
@@ -142,6 +380,20 @@ end
 
 AnchorInfo(reference_positions::Matrix{Float64}) = AnchorInfo(Int[], collect(1:size(reference_positions, 1)), reference_positions, zeros(0, 3))
 
+"""
+    OptimizationProblem
+
+Complete problem definition combining topology, loads, geometry, and parameters.
+
+# Fields
+- `topology::NetworkTopology`: Network graph structure
+- `loads::LoadData`: External loads
+- `geometry::GeometryData`: Fixed node positions
+- `anchors::AnchorInfo`: Anchor configuration
+- `parameters::OptimizationParameters`: Objectives and solver settings
+
+This is the main input structure constructed from JSON received via WebSocket.
+"""
 struct OptimizationProblem
     topology::NetworkTopology
     loads::LoadData
@@ -150,6 +402,23 @@ struct OptimizationProblem
     parameters::OptimizationParameters
 end
 
+"""
+    GeometrySnapshot
+
+Snapshot of the current geometry state during or after optimization.
+
+# Type Parameters
+Parametric types allow this to work with both regular arrays and dual numbers
+for automatic differentiation.
+
+# Fields
+- `xyz_free`: Positions of free nodes
+- `xyz_fixed`: Positions of fixed nodes
+- `xyz_full`: All node positions combined
+- `member_lengths`: Current member lengths
+- `member_forces`: Current member forces (force density × length)
+- `reactions`: Reaction forces at anchor nodes
+"""
 struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
     xyz_free::TF
     xyz_fixed::TX
@@ -159,6 +428,24 @@ struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
     reactions::TR
 end
 
+"""
+    OptimizationCache
+
+Pre-allocated buffers and factorizations for efficient FDM solves.
+
+This mutable struct holds all working memory needed for the Force Density Method
+solver and its automatic differentiation. Pre-allocating these buffers avoids
+memory allocation during optimization iterations.
+
+# Key Components
+- `A`, `factor`: Sparse matrix and its LDL factorization for the linear system
+- `q_to_nz`: Mapping from force densities to matrix non-zero entries
+- `Cn`, `Cf`: Free and fixed incidence matrices (Float64 versions)
+- `x`, `grad_x`, `q`, `grad_q`: Primal variables and their gradients
+- Various intermediate buffers for matrix operations
+
+Constructed via `OptimizationCache(problem::OptimizationProblem)`.
+"""
 mutable struct OptimizationCache
     # CPU Solver
     A::SparseMatrixCSC{Float64, Int64}
@@ -304,6 +591,23 @@ function find_nz_index(A::SparseMatrixCSC, i::Integer, j::Integer)
     error("Index ($i, $j) not found in sparse matrix")
 end
 
+"""
+    OptimizationState
+
+Mutable state that evolves during optimization.
+
+# Fields
+- `force_densities::Vector{Float64}`: Current force density values (optimization variables)
+- `variable_anchor_positions::Matrix{Float64}`: Current positions of variable anchors
+- `loss_trace::Vector{Float64}`: History of loss values
+- `penalty_trace::Vector{Float64}`: History of penalty values
+- `node_trace::Vector{Matrix{Float64}}`: History of node positions (if tracing enabled)
+- `iterations::Int`: Number of completed iterations
+- `cache::Union{Nothing,OptimizationCache}`: Pre-allocated solver buffers
+
+This struct is modified in-place during optimization. The force densities are
+the primary optimization variables.
+"""
 mutable struct OptimizationState
     force_densities::Vector{Float64}
     variable_anchor_positions::Matrix{Float64}
@@ -317,6 +621,20 @@ end
 OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = 
     OptimizationState(force_densities, variable_anchor_positions, Float64[], Float64[], Matrix{Float64}[], 0, nothing)
 
+"""
+    ObjectiveContext
+
+Context information passed to objective builders for index resolution.
+
+# Fields
+- `num_edges::Int`: Total number of edges
+- `num_nodes::Int`: Total number of nodes
+- `free_node_indices::Vector{Int}`: Which nodes are free
+- `fixed_node_indices::Vector{Int}`: Which nodes are fixed
+
+Used internally when parsing JSON objective specifications to resolve
+index references like "all edges" or "all free nodes".
+"""
 struct ObjectiveContext
     num_edges::Int
     num_nodes::Int

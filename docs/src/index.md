@@ -1,53 +1,110 @@
+# Theseus.jl
 
-# Theseus
+Theseus is a [Julia](https://julialang.org/) package for **form-finding and optimization of tensile structures**, compression structures, and mixed tension/compression structures using the **Force Density Method (FDM)**.
 
-Theseus is a [Julia](https://julialang.org/) package for form-finding and optimization of tensile structures, compression structures, and mixed tension/compression structures. It is a companion package to [Ariadne](https://github.com/fibrous-tendencies/Ariadne). Theseus starts a local server and can communicate with Ariadne via WebSockets.
+It is designed as a computational backend for [Ariadne](https://github.com/fibrous-tendencies/Ariadne), a Grasshopper plugin for Rhino3D, enabling real-time structural optimization in an interactive design environment.
+
+## Key Features
+
+- **Force Density Method**: Efficient linear solver for computing equilibrium shapes of cable and strut networks
+- **Gradient-Based Optimization**: L-BFGS optimization with automatic differentiation via [Mooncake.jl](https://github.com/compintell/Mooncake.jl)
+- **Multiple Objective Types**: 13+ objective functions including target positions, length/force constraints, and reaction force objectives
+- **Real-Time Communication**: WebSocket server for interactive design with Grasshopper/Rhino
+
+## Architecture
+
+Theseus operates as a server that communicates with the Ariadne Grasshopper plugin via WebSockets:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Grasshopper / Rhino3D                      │
+│                    (Ariadne Plugin)                         │
+└─────────────────────────────────────────────────────────────┘
+                            │ WebSocket (JSON)
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Theseus.jl Server                      │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
+│  │   Parser    │───▶│  Optimizer  │───▶│   Solver    │     │
+│  │  (types.jl) │    │(optimization│    │  (FDM.jl)   │     │
+│  └─────────────┘    │    .jl)     │    └─────────────┘     │
+│                     └─────────────┘           │            │
+│                           │                   ▼            │
+│                     ┌─────────────┐    ┌─────────────┐     │
+│                     │ Objectives  │    │  Autodiff   │     │
+│                     │(objectives  │    │ (adjoint.jl)│     │
+│                     │    .jl)     │    └─────────────┘     │
+│                     └─────────────┘                        │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ## Installation
 
-Installation of Theseus requires the Julia REPL which can be downloaded from [here](https://julialang.org/downloads/). Theseus was developed using Julia 1.9.3. Theseus is not registered in the Julia package registry so you will need to install it using the directions below. Even if you do not plan on using the Julia REPL for anything else it is generally recommended that you create a new environment. This is similar to environments when using conda for Python development. On Windows you may need to run the Julia REPL.
+### Prerequisites
 
-To create a new environment in Julia, open the REPL that you just installed. Enter package mode by typing:
+1. **Julia**: Download and install Julia from [julialang.org/downloads](https://julialang.org/downloads/). Theseus requires Julia 1.9 or later (1.11+ recommended).
 
-```julia
-]
+2. **Ariadne** (optional but typical): Install the [Ariadne Grasshopper plugin](https://github.com/fibrous-tendencies/Ariadne) to use Theseus interactively.
+
+### Installing Theseus
+
+1. Open the Julia REPL
+
+2. Enter package mode by pressing `]`
+
+3. Create and activate a new environment (recommended):
+   ```julia
+   activate Theseus
+   ```
+
+4. Install the package:
+   ```julia
+   add https://github.com/adam-t-burke/Theseus.jl
+   ```
+
+5. Press `Backspace` to exit package mode
+
+## Starting the Server
+
+Each time you want to use Theseus:
+
+1. Open the Julia REPL
+
+2. Activate your environment:
+   ```julia
+   ] activate Theseus
+   ```
+   (Press `Backspace` to exit package mode)
+
+3. Load and start Theseus:
+   ```julia
+   using Theseus
+   start!()
+   ```
+
+You should see:
+```
+[ Info: Theseus server listening host = "127.0.0.1" port = 2000
 ```
 
-This should display the current environment name. By default this will say something like @v1.9 if you have downloaded Julia v1.9.XX. Once you are in this mode, enter the following:
+The server is now ready to receive connections from Ariadne.
 
+### Custom Port
+
+To use a different port:
 ```julia
-activate Theseus
+start!(port=3000)
 ```
 
-Press enter to execute this command. This will create a new environment with the name Theseus. You will need to navigate back into this environment every time you start up Theseus. It doesn't need to be named Theseus, it could be named anything you like, but here I name is with the same name as the package for clarity.
+## Next Steps
 
-To actually install the package type:
+- **[Concepts](@ref)**: Learn about the Force Density Method, optimization approach, and available objectives
+- **[API Reference](@ref)**: Detailed documentation of types and functions
 
-```julia
-add https://github.com/fibrous-tendencies/Theseus.jl
-```
+## Citation
 
-Press enter to execute this command. Once all of the dependencies have been installed you can press backspace to exit pkg mode. The word julia should reappear.
+If you use Theseus in your research, please cite it appropriately. See the [CITATION.cff](https://github.com/adam-t-burke/Theseus.jl/blob/main/CITATION.cff) file for details.
 
-## Usage
+## License
 
-To use Theseus you always need to activate the environment where it has been installed. If you are just following the steps for installation up to here then you should already be in the correct environment. If you are re-starting Theseus you will need to re-activate the environment every time you want to use it. To activate the environment again just follow the same instructions listed in Installation.
-
-There is only one functiona available to call with Theseus. To use this function first type:
-
-```julia
-using Theseus
-```
-
-Then press enter.
-
-> [!NOTE]
-> Capitalization is important here.
-
-Finally, to start the server type:
-
-```julia
-start!()
-```
-
-Then press enter. A message that the server has opened should appear. Theseus is now running, you can go back into Grasshopper and set up your networks for form-finding and optimization with Ariadne.
+Theseus is open source software. See the [LICENSE](https://github.com/adam-t-burke/Theseus.jl/blob/main/LICENSE) file for details.
