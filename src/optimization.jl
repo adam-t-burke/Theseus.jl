@@ -1,27 +1,70 @@
 using LinearAlgebra
 using Optim
-using Zygote
-using ChainRulesCore: ignore_derivatives
-using Logging
+import Mooncake
+import ADTypes
+import DifferentiationInterface
+using TimerOutputs
 
-struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
-    xyz_free::TF
-    xyz_fixed::TX
-    xyz_full::TA
-    member_lengths::VL
-    member_forces::VF
-    reactions::TR
-end
+"""
+    evaluate_geometry(problem, q, anchor_positions, cache) -> GeometrySnapshot
 
-function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real})
-    fixed_positions = current_fixed_positions(problem, anchor_positions)
-    xyz_free = solve_explicit(q, problem.topology.free_incidence, problem.topology.fixed_incidence, problem.loads.free_node_loads, fixed_positions)
-    xyz_full = vcat(xyz_free, fixed_positions)
-    member_vectors = problem.topology.incidence * xyz_full
-    member_lengths = map(norm, eachrow(member_vectors))
-    member_forces = q .* member_lengths
-    reactions = anchor_reactions(problem.topology, q, xyz_full)
-    GeometrySnapshot(xyz_free, fixed_positions, xyz_full, member_lengths, member_forces, reactions)
+Compute the equilibrium geometry for given force densities using the Force Density Method.
+
+Solves the FDM linear system, then computes member lengths, forces, and reaction forces.
+Results are stored in `cache` and returned as a [`GeometrySnapshot`](@ref).
+
+# Arguments
+- `problem::OptimizationProblem`: The problem definition
+- `q::AbstractVector{<:Real}`: Force density values for each edge
+- `anchor_positions::AbstractMatrix{<:Real}`: Current positions of variable anchors
+- `cache::OptimizationCache`: Pre-allocated buffers for the solver
+
+# Returns
+A `GeometrySnapshot` containing node positions, member lengths/forces, and reactions.
+"""
+function evaluate_geometry(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, cache::OptimizationCache)
+    # In-place update of cache buffers
+    solve_FDM!(cache, q, problem, anchor_positions)
+    xyz_full = cache.Nf
+    ne = length(cache.member_lengths)
+    for i in 1:ne
+        s = cache.edge_starts[i]
+        e = cache.edge_ends[i]
+        
+        dx = xyz_full[e, 1] - xyz_full[s, 1]
+        dy = xyz_full[e, 2] - xyz_full[s, 2]
+        dz = xyz_full[e, 3] - xyz_full[s, 3]
+        
+        len = sqrt(dx^2 + dy^2 + dz^2)
+        cache.member_lengths[i] = len
+        cache.member_forces[i] = q[i] * len
+    end
+
+    fill!(cache.reactions, 0.0)
+    for i in 1:ne
+        s = cache.edge_starts[i]
+        e = cache.edge_ends[i]
+        qi = q[i]
+        
+        rx = (xyz_full[e, 1] - xyz_full[s, 1]) * qi
+        ry = (xyz_full[e, 2] - xyz_full[s, 2]) * qi
+        rz = (xyz_full[e, 3] - xyz_full[s, 3]) * qi
+        
+        cache.reactions[s, 1] += rx
+        cache.reactions[s, 2] += ry
+        cache.reactions[s, 3] += rz
+        
+        cache.reactions[e, 1] -= rx
+        cache.reactions[e, 2] -= ry
+        cache.reactions[e, 3] -= rz
+    end
+
+    xyz_free = @view xyz_full[problem.topology.free_node_indices, :]
+    xyz_fixed = @view xyz_full[problem.topology.fixed_node_indices, :]
+    
+    snapshot = GeometrySnapshot(xyz_free, xyz_fixed, xyz_full, cache.member_lengths, cache.member_forces, cache.reactions)
+    cache.last_snapshot = snapshot
+    return snapshot
 end
 
 function objective_loss(obj::TargetXYZObjective, snapshot::GeometrySnapshot)
@@ -46,7 +89,11 @@ end
 
 function objective_loss(obj::SumForceLengthObjective, snapshot::GeometrySnapshot)
     edges = obj.edge_indices
-    obj.weight * sum(snapshot.member_lengths[edges] .* snapshot.member_forces[edges])
+    loss = zero(eltype(snapshot.member_lengths))
+    for idx in edges
+        loss += snapshot.member_lengths[idx] * snapshot.member_forces[idx]
+    end
+    obj.weight * loss
 end
 
 function objective_loss(obj::MinLengthObjective, snapshot::GeometrySnapshot)
@@ -80,6 +127,9 @@ end
 objective_loss(::AbstractObjective, snapshot::GeometrySnapshot) = zero(eltype(snapshot.member_lengths))
 
 function total_loss(problem::OptimizationProblem, q::AbstractVector{<:Real}, anchor_positions::AbstractMatrix{<:Real}, snapshot::GeometrySnapshot)
+    # Note: we use state.cache.to if we have access to it, but total_loss 
+    # doesn't take cache. We could pass it, but for now we'll just sum.
+    # Actually, evaluate_geometry already updated the cache.
     loss = zero(eltype(snapshot.member_lengths))
     for obj in problem.parameters.objectives
         loss += objective_loss(obj, snapshot)
@@ -105,50 +155,19 @@ function unpack_parameters(problem::OptimizationProblem, θ::AbstractVector{T}) 
     q, anchors
 end
 
-function form_finding_objective(problem::OptimizationProblem, trace_state::OptimizationState)
-    empty!(trace_state.loss_trace)
-    empty!(trace_state.node_trace)
-    trace_state.iterations = 0
-
+function form_finding_objective(problem::OptimizationProblem, cache::OptimizationCache, lb, ub, lb_idx, ub_idx, barrier_weight, sharpness)
     function objective(θ)
         q, anchors = unpack_parameters(problem, θ)
-        snapshot = evaluate_geometry(problem, q, anchors)
-        loss = total_loss(problem, q, anchors, snapshot)
-        if !isderiving()
-            ignore_derivatives() do
-                trace_state.force_densities = copy(q)
-                trace_state.variable_anchor_positions = copy(anchors)
-                push!(trace_state.loss_trace, loss)
-                if problem.parameters.tracing.record_nodes
-                    push!(trace_state.node_trace, copy(snapshot.xyz_full))
-                end
-            end
-        end
-        loss
+        snapshot = evaluate_geometry(problem, q, anchors, cache)
+        
+        geometric_loss = total_loss(problem, q, anchors, snapshot)
+        barrier_loss = pBounds(θ, lb, ub, lb_idx, ub_idx, sharpness, sharpness)
+        
+        loss = geometric_loss + (barrier_loss * barrier_weight)
+        return loss
     end
 
     objective
-end
-
-function log_lambda_multipliers(min_θ::AbstractVector{<:Real}, grad::AbstractVector{<:Real}, lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real})
-    tol = sqrt(eps(Float64))
-    lower_values = Float64[]
-    upper_values = Float64[]
-    for i in eachindex(min_θ)
-        if isfinite(lower[i]) && min_θ[i] <= lower[i] + tol
-            push!(lower_values, max(0.0, grad[i]))
-        elseif isfinite(upper[i]) && min_θ[i] >= upper[i] - tol
-            push!(upper_values, max(0.0, -grad[i]))
-        end
-    end
-
-    stats(values) = isempty(values) ? (count=0, max=0.0, sum=0.0) : (count=length(values), max=maximum(values), sum=sum(values))
-    lower_stats = stats(lower_values)
-    upper_stats = stats(upper_values)
-
-    @info "KKT multipliers" lower_active=lower_stats.count upper_active=upper_stats.count max_lower=lower_stats.max max_upper=upper_stats.max sum_lower=lower_stats.sum sum_upper=upper_stats.sum
-    @debug "Lower-bound multipliers" values=lower_values
-    @debug "Upper-bound multipliers" values=upper_values
 end
 
 function parameter_bounds(problem::OptimizationProblem)
@@ -163,43 +182,113 @@ function parameter_bounds(problem::OptimizationProblem)
     lower, upper
 end
 
-function make_gradient(objective)
-    function g!(G, θ)
-        grad = gradient(objective, θ)[1]
-        copyto!(G, grad)
-    end
-    g!
-end
+"""
+    optimize_problem!(problem, state; on_iteration=nothing) -> (result, snapshot)
 
+Run L-BFGS optimization to minimize the objective functions.
+
+Uses automatic differentiation via Mooncake.jl to compute gradients efficiently.
+The optimization modifies `state` in-place, updating force densities and recording
+the loss history.
+
+# Arguments
+- `problem::OptimizationProblem`: Problem definition with objectives and constraints
+- `state::OptimizationState`: Mutable state with initial force densities
+
+# Keyword Arguments
+- `on_iteration`: Optional callback `(state, snapshot, loss) -> nothing` called each iteration
+
+# Returns
+- `result`: Optim.jl optimization result object
+- `snapshot::GeometrySnapshot`: Final geometry state
+
+# Notes
+Barrier functions are used for bound constraints rather than projected gradients,
+allowing smooth gradients for the autodiff system.
+"""
 function optimize_problem!(problem::OptimizationProblem, state::OptimizationState; on_iteration=nothing)
-    objective = form_finding_objective(problem, state)
-    gradient! = make_gradient(objective)
-    θ0 = pack_parameters(problem, state)
+    # Ensure cache is initialized
+    if isnothing(state.cache)
+        state.cache = OptimizationCache(problem)
+    end
+    reset_timer!(state.cache.to)
+
+    # Clear traces
+    empty!(state.loss_trace)
+    empty!(state.penalty_trace)
+    empty!(state.node_trace)
+    state.iterations = 0
+
+    solver = problem.parameters.solver
     lower_bounds, upper_bounds = parameter_bounds(problem)
-    outer_iter = Ref(0)
-    callback = function (_opt_state)
-        outer_iter[] += 1
-        state.iterations = outer_iter[]
-        if on_iteration === nothing || isempty(state.loss_trace)
-            return false
+    θ0 = pack_parameters(problem, state)
+    
+    # Precompute barrier indices
+    lb_idx = findall(isfinite, lower_bounds)
+    ub_idx = findall(isfinite, upper_bounds)
+    
+    # check initial bounds
+    initial_violations_lower = θ0[lb_idx] .< lower_bounds[lb_idx]
+    initial_violations_upper = θ0[ub_idx] .> upper_bounds[ub_idx]
+    if any(initial_violations_lower) || any(initial_violations_upper)
+        @warn "Initial guess is outside bounds" num_lower=sum(initial_violations_lower) num_upper=sum(initial_violations_upper)
+    end
+
+    objective = form_finding_objective(problem, state.cache, lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_weight, solver.barrier_sharpness)
+    
+    # Setup Mooncake backend via DifferentiationInterface
+    backend = ADTypes.AutoMooncake(config=Mooncake.Config(friendly_tangents=true))
+    prep = DifferentiationInterface.prepare_gradient(objective, backend, θ0)
+    
+    function fg!(F, G, θ)
+        if G !== nothing
+            val, _ = DifferentiationInterface.value_and_gradient!(objective, G, prep, backend, θ)
+            return val
+        elseif F !== nothing
+            return objective(θ)
         end
-        snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
-        loss = state.loss_trace[end]
-        on_iteration(state, snapshot, loss)
+        return nothing
+    end
+    
+    callback = function (os)
+        state.iterations = os.iteration
+        
+        # Unpack current θ
+        # Note: We don't perform a NEW evaluation here because fg!/objective already did it
+        # and stored the result in state.cache.last_snapshot
+        snapshot = state.cache.last_snapshot
+        q = snapshot.member_forces ./ snapshot.member_lengths # approximate q if needed, but better to get from metadata if possible
+        # Actually, let's just use the metadata x if we really need q, anchors for state
+        q_new, anchors_new = unpack_parameters(problem, os.metadata["x"])
+        state.force_densities = q_new
+        state.variable_anchor_positions = anchors_new
+        
+        push!(state.loss_trace, os.value)
+        penalty = pBounds(os.metadata["x"], lower_bounds, upper_bounds, lb_idx, ub_idx, solver.barrier_sharpness, solver.barrier_sharpness)
+        push!(state.penalty_trace, penalty * solver.barrier_weight)
+        
+        if problem.parameters.tracing.record_nodes
+            push!(state.node_trace, copy(snapshot.xyz_full))
+        end
+        
+        if on_iteration !== nothing
+            on_iteration(state, snapshot, os.value)
+        end
         return false
     end
+    
     result = Optim.optimize(
-        objective,
-        gradient!,
-        lower_bounds,
-        upper_bounds,
+        Optim.only_fg!(fg!),
         θ0,
-        Fminbox(LBFGS()),
+        LBFGS(),
         Optim.Options(
-            iterations = problem.parameters.solver.max_iterations,
-            f_abstol = problem.parameters.solver.absolute_tolerance,
-            f_reltol = problem.parameters.solver.relative_tolerance,
+            iterations = solver.max_iterations,
+            f_abstol = solver.absolute_tolerance, # Change in objective
+            f_reltol = solver.relative_tolerance, # Relative change in objective
+            g_abstol = solver.absolute_tolerance, # Gradient norm
+            g_tol = solver.relative_tolerance,    # Gradient tolerance (often used as relative)
             callback = callback,
+            extended_trace = true
         ),
     )
 
@@ -207,9 +296,8 @@ function optimize_problem!(problem::OptimizationProblem, state::OptimizationStat
     q, anchors = unpack_parameters(problem, min_θ)
     state.force_densities = copy(q)
     state.variable_anchor_positions = copy(anchors)
-    snapshot = evaluate_geometry(problem, q, anchors)
+    # One last evaluation with the cache to ensure state is consistent and get the final snapshot
+    snapshot = evaluate_geometry(problem, q, anchors, state.cache)
 
-    grad_at_solution = gradient(objective, min_θ)[1]
-    log_lambda_multipliers(min_θ, grad_at_solution, lower_bounds, upper_bounds)
     return result, snapshot
 end

@@ -1,44 +1,129 @@
 using JSON3
 using SparseArrays
 using LinearAlgebra
+using TimerOutputs
 
 const DEFAULT_BARRIER_SHARPNESS = 10.0
 
+"""
+    AbstractObjective
+
+Abstract supertype for all optimization objectives in Theseus.
+
+Concrete subtypes define specific optimization goals such as target positions,
+length constraints, force constraints, and reaction force objectives. Each objective
+type has a `weight` field that controls its relative importance in the total loss function.
+
+See also: [`TargetXYZObjective`](@ref), [`TargetLengthObjective`](@ref), [`MinLengthObjective`](@ref)
+"""
 abstract type AbstractObjective end
 
+"""
+    TargetXYZObjective <: AbstractObjective
+
+Objective that penalizes deviation of free nodes from target 3D positions.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective in the total loss
+- `node_indices::Vector{Int}`: Indices of nodes to constrain
+- `target::Matrix{Float64}`: Target positions as an N×3 matrix (x, y, z per row)
+
+This is the primary objective for form-finding when you want nodes to reach
+specific spatial positions.
+"""
 Base.@kwdef struct TargetXYZObjective <: AbstractObjective
     weight::Float64
     node_indices::Vector{Int}
     target::Matrix{Float64}
 end
 
+"""
+    TargetXYObjective <: AbstractObjective
+
+Objective that penalizes deviation of free nodes from target XY positions (ignoring Z).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `node_indices::Vector{Int}`: Indices of nodes to constrain
+- `target::Matrix{Float64}`: Target positions as an N×3 matrix (only x, y used)
+
+Useful for planar constraints where vertical position should be determined by equilibrium.
+"""
 Base.@kwdef struct TargetXYObjective <: AbstractObjective
     weight::Float64
     node_indices::Vector{Int}
     target::Matrix{Float64}
 end
 
+"""
+    TargetLengthObjective <: AbstractObjective
+
+Objective that penalizes deviation of member lengths from target values.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `target::Vector{Float64}`: Target length for each edge
+"""
 Base.@kwdef struct TargetLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
     target::Vector{Float64}
 end
 
+"""
+    LengthVariationObjective <: AbstractObjective
+
+Objective that minimizes variance in member lengths (promotes uniformity).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to consider
+"""
 Base.@kwdef struct LengthVariationObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
 end
 
+"""
+    ForceVariationObjective <: AbstractObjective
+
+Objective that minimizes variance in member forces (promotes uniform stress).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to consider
+"""
 Base.@kwdef struct ForceVariationObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
 end
 
+"""
+    SumForceLengthObjective <: AbstractObjective
+
+Objective that minimizes the sum of force times length (related to structural volume).
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to consider
+"""
 Base.@kwdef struct SumForceLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
 end
 
+"""
+    MinLengthObjective <: AbstractObjective
+
+Soft constraint enforcing minimum member lengths using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Minimum allowed length for each edge
+- `sharpness::Float64`: Barrier sharpness (higher = steeper penalty near threshold)
+"""
 Base.@kwdef struct MinLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -46,6 +131,17 @@ Base.@kwdef struct MinLengthObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    MaxLengthObjective <: AbstractObjective
+
+Soft constraint enforcing maximum member lengths using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Maximum allowed length for each edge
+- `sharpness::Float64`: Barrier sharpness (higher = steeper penalty near threshold)
+"""
 Base.@kwdef struct MaxLengthObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -53,6 +149,17 @@ Base.@kwdef struct MaxLengthObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    MinForceObjective <: AbstractObjective
+
+Soft constraint enforcing minimum member forces using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Minimum allowed force for each edge
+- `sharpness::Float64`: Barrier sharpness
+"""
 Base.@kwdef struct MinForceObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -60,6 +167,17 @@ Base.@kwdef struct MinForceObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    MaxForceObjective <: AbstractObjective
+
+Soft constraint enforcing maximum member forces using a smooth barrier function.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `edge_indices::Vector{Int}`: Indices of edges to constrain
+- `threshold::Vector{Float64}`: Maximum allowed force for each edge
+- `sharpness::Float64`: Barrier sharpness
+"""
 Base.@kwdef struct MaxForceObjective <: AbstractObjective
     weight::Float64
     edge_indices::Vector{Int}
@@ -67,18 +185,49 @@ Base.@kwdef struct MaxForceObjective <: AbstractObjective
     sharpness::Float64 = DEFAULT_BARRIER_SHARPNESS
 end
 
+"""
+    RigidSetCompareObjective <: AbstractObjective
+
+Objective that compares node positions to a rigid reference shape, allowing rotation and translation.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `node_indices::Vector{Int}`: Indices of nodes in the set
+- `target::Matrix{Float64}`: Reference shape positions
+"""
 Base.@kwdef struct RigidSetCompareObjective <: AbstractObjective
     weight::Float64
     node_indices::Vector{Int}
     target::Matrix{Float64}
 end
 
+"""
+    ReactionDirectionObjective <: AbstractObjective
+
+Objective that penalizes deviation of anchor reaction forces from target directions.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `anchor_indices::Vector{Int}`: Indices of anchor nodes
+- `target_directions::Matrix{Float64}`: Unit direction vectors (N×3 matrix)
+"""
 Base.@kwdef struct ReactionDirectionObjective <: AbstractObjective
     weight::Float64
     anchor_indices::Vector{Int}
     target_directions::Matrix{Float64}
 end
 
+"""
+    ReactionDirectionMagnitudeObjective <: AbstractObjective
+
+Objective that penalizes deviation of anchor reactions from target directions AND magnitudes.
+
+# Fields
+- `weight::Float64`: Relative weight of this objective
+- `anchor_indices::Vector{Int}`: Indices of anchor nodes
+- `target_directions::Matrix{Float64}`: Unit direction vectors (N×3 matrix)
+- `target_magnitudes::Vector{Float64}`: Target force magnitudes
+"""
 Base.@kwdef struct ReactionDirectionMagnitudeObjective <: AbstractObjective
     weight::Float64
     anchor_indices::Vector{Int}
@@ -86,31 +235,97 @@ Base.@kwdef struct ReactionDirectionMagnitudeObjective <: AbstractObjective
     target_magnitudes::Vector{Float64}
 end
 
+"""
+    Bounds
+
+Box constraints on force density variables.
+
+# Fields
+- `lower::Vector{Float64}`: Lower bounds for each force density
+- `upper::Vector{Float64}`: Upper bounds for each force density
+
+Force densities are constrained to be positive by default (lower bound ~1e-8)
+to ensure tension-only or compression-only behavior.
+"""
 struct Bounds
     lower::Vector{Float64}
     upper::Vector{Float64}
 end
 
-struct SolverOptions
+"""
+    SolverOptions
+
+Configuration for the L-BFGS optimization solver.
+
+# Fields
+- `absolute_tolerance::Float64`: Absolute convergence tolerance
+- `relative_tolerance::Float64`: Relative convergence tolerance
+- `max_iterations::Int`: Maximum number of iterations
+- `report_frequency::Int`: How often to report progress
+- `show_progress::Bool`: Whether to print iteration info
+- `barrier_weight::Float64`: Weight for barrier penalty terms
+- `barrier_sharpness::Float64`: Sharpness of barrier functions
+- `use_auto_scaling::Bool`: Whether to auto-scale the problem
+"""
+Base.@kwdef struct SolverOptions
     absolute_tolerance::Float64
     relative_tolerance::Float64
     max_iterations::Int
     report_frequency::Int
     show_progress::Bool
+    barrier_weight::Float64
+    barrier_sharpness::Float64
+    use_auto_scaling::Bool
 end
 
-struct TracingOptions
+"""
+    TracingOptions
+
+Options for recording optimization history.
+
+# Fields
+- `record_nodes::Bool`: Whether to record node positions at each iteration
+- `emit_frequency::Int`: How often to emit intermediate results via WebSocket
+"""
+Base.@kwdef struct TracingOptions
     record_nodes::Bool
     emit_frequency::Int
 end
 
-struct OptimizationParameters
+"""
+    OptimizationParameters
+
+Complete specification of the optimization problem parameters.
+
+# Fields
+- `objectives::Vector{AbstractObjective}`: List of objective functions to minimize
+- `bounds::Bounds`: Box constraints on force densities
+- `solver::SolverOptions`: Solver configuration
+- `tracing::TracingOptions`: History recording options
+"""
+Base.@kwdef struct OptimizationParameters
     objectives::Vector{AbstractObjective}
     bounds::Bounds
     solver::SolverOptions
     tracing::TracingOptions
 end
 
+"""
+    NetworkTopology
+
+Graph structure of the cable/strut network.
+
+# Fields
+- `incidence::SparseMatrixCSC{Int,Int}`: Full edge-node incidence matrix (ne × nn)
+- `free_incidence::SparseMatrixCSC{Int,Int}`: Incidence for free nodes only
+- `fixed_incidence::SparseMatrixCSC{Int,Int}`: Incidence for fixed/anchor nodes only
+- `num_edges::Int`: Total number of edges (members)
+- `num_nodes::Int`: Total number of nodes
+- `free_node_indices::Vector{Int}`: Indices of nodes that can move
+- `fixed_node_indices::Vector{Int}`: Indices of anchor/support nodes
+
+The incidence matrix has +1 for edge end nodes and -1 for edge start nodes.
+"""
 struct NetworkTopology
     incidence::SparseMatrixCSC{Int, Int}
     free_incidence::SparseMatrixCSC{Int, Int}
@@ -121,14 +336,41 @@ struct NetworkTopology
     fixed_node_indices::Vector{Int}
 end
 
+"""
+    LoadData
+
+External loads applied to free nodes.
+
+# Fields
+- `free_node_loads::Matrix{Float64}`: Load vectors as an N×3 matrix (fx, fy, fz per row)
+"""
 struct LoadData
     free_node_loads::Matrix{Float64}
 end
 
+"""
+    GeometryData
+
+Fixed node (anchor) positions.
+
+# Fields
+- `fixed_node_positions::Matrix{Float64}`: Anchor positions as an N×3 matrix
+"""
 struct GeometryData
     fixed_node_positions::Matrix{Float64}
 end
 
+"""
+    AnchorInfo
+
+Information about anchor nodes, including which can vary during optimization.
+
+# Fields
+- `variable_indices::Vector{Int}`: Indices of anchors that can move during optimization
+- `fixed_indices::Vector{Int}`: Indices of anchors with fixed positions
+- `reference_positions::Matrix{Float64}`: Reference positions for all anchors
+- `initial_variable_positions::Matrix{Float64}`: Starting positions for variable anchors
+"""
 Base.@kwdef struct AnchorInfo
     variable_indices::Vector{Int}
     fixed_indices::Vector{Int}
@@ -138,6 +380,20 @@ end
 
 AnchorInfo(reference_positions::Matrix{Float64}) = AnchorInfo(Int[], collect(1:size(reference_positions, 1)), reference_positions, zeros(0, 3))
 
+"""
+    OptimizationProblem
+
+Complete problem definition combining topology, loads, geometry, and parameters.
+
+# Fields
+- `topology::NetworkTopology`: Network graph structure
+- `loads::LoadData`: External loads
+- `geometry::GeometryData`: Fixed node positions
+- `anchors::AnchorInfo`: Anchor configuration
+- `parameters::OptimizationParameters`: Objectives and solver settings
+
+This is the main input structure constructed from JSON received via WebSocket.
+"""
 struct OptimizationProblem
     topology::NetworkTopology
     loads::LoadData
@@ -146,16 +402,239 @@ struct OptimizationProblem
     parameters::OptimizationParameters
 end
 
+"""
+    GeometrySnapshot
+
+Snapshot of the current geometry state during or after optimization.
+
+# Type Parameters
+Parametric types allow this to work with both regular arrays and dual numbers
+for automatic differentiation.
+
+# Fields
+- `xyz_free`: Positions of free nodes
+- `xyz_fixed`: Positions of fixed nodes
+- `xyz_full`: All node positions combined
+- `member_lengths`: Current member lengths
+- `member_forces`: Current member forces (force density × length)
+- `reactions`: Reaction forces at anchor nodes
+"""
+struct GeometrySnapshot{TF, TX, TA, VL, VF, TR}
+    xyz_free::TF
+    xyz_fixed::TX
+    xyz_full::TA
+    member_lengths::VL
+    member_forces::VF
+    reactions::TR
+end
+
+"""
+    OptimizationCache
+
+Pre-allocated buffers and factorizations for efficient FDM solves.
+
+This mutable struct holds all working memory needed for the Force Density Method
+solver and its automatic differentiation. Pre-allocating these buffers avoids
+memory allocation during optimization iterations.
+
+# Key Components
+- `A`, `factor`: Sparse matrix and its LDL factorization for the linear system
+- `q_to_nz`: Mapping from force densities to matrix non-zero entries
+- `Cn`, `Cf`: Free and fixed incidence matrices (Float64 versions)
+- `x`, `grad_x`, `q`, `grad_q`: Primal variables and their gradients
+- Various intermediate buffers for matrix operations
+
+Constructed via `OptimizationCache(problem::OptimizationProblem)`.
+"""
+mutable struct OptimizationCache
+    # CPU Solver
+    A::SparseMatrixCSC{Float64, Int64}
+    factor::LDLFactorizations.LDLFactorization{Float64, Int64}
+    q_to_nz::Vector{Vector{Tuple{Int, Float64}}} # maps edge index -> indices and coeffs in A.nzval
+    edge_starts::Vector{Int} # node index (1..nn)
+    edge_ends::Vector{Int}   # node index (1..nn)
+    node_to_free_idx::Vector{Int} # node index (1..nn) -> index in Cn (0 if fixed)
+
+    # Constant topology buffers
+    Cn::SparseMatrixCSC{Float64, Int64}
+    Cf::SparseMatrixCSC{Float64, Int64}
+
+    # Buffers (primal)
+    x::Matrix{Float64}
+    λ::Matrix{Float64}
+    grad_x::Matrix{Float64}
+    q::Vector{Float64}
+    grad_q::Vector{Float64}
+    grad_Nf::Matrix{Float64} # Gradient w.r.t. fixed node positions
+    
+    # Primal result buffers
+    member_lengths::Vector{Float64}
+    member_forces::Vector{Float64}
+    reactions::Matrix{Float64}
+
+    # Intermediate buffers for RHS
+    Cf_Nf::Matrix{Float64}
+    Q_Cf_Nf::Matrix{Float64}
+    Pn::Matrix{Float64}
+    Nf::Matrix{Float64} # Buffer for current full node positions
+    Nf_fixed::Matrix{Float64} # Dense buffer for fixed nodes only
+
+    # Profiling and state
+    to::TimerOutput
+    last_snapshot::Union{Nothing, GeometrySnapshot}
+
+    function OptimizationCache(problem::OptimizationProblem)
+        topo = problem.topology
+        Cn = convert(SparseMatrixCSC{Float64, Int64}, topo.free_incidence)
+        Cf = convert(SparseMatrixCSC{Float64, Int64}, topo.fixed_incidence)
+        ne = topo.num_edges
+        nn_free = length(topo.free_node_indices)
+
+        # 1. Construct sparsity pattern for A = Cn' * diag(q) * Cn
+        A_template = sparse(Cn' * Cn)
+        nz = nnz(A_template)
+        A = SparseMatrixCSC{Float64, Int64}(A_template.m, A_template.n, A_template.colptr, A_template.rowval, zeros(nz))
+        
+        # Mapping from edge to nzval indices
+        q_to_nz = [Tuple{Int, Float64}[] for _ in 1:ne]
+        edge_starts = zeros(Int, ne)
+        edge_ends = zeros(Int, ne)
+        node_to_free_idx = zeros(Int, topo.num_nodes)
+        for (i, node_idx) in enumerate(topo.free_node_indices)
+            node_to_free_idx[node_idx] = i
+        end
+
+        # Pre-process incidence to get nodes of each edge
+        incidence = problem.topology.incidence
+        for col in 1:topo.num_nodes
+            for idx in incidence.colptr[col]:(incidence.colptr[col+1]-1)
+                row = incidence.rowval[idx]
+                val = incidence.nzval[idx]
+                if val == -1.0
+                    edge_starts[row] = col
+                elseif val == 1.0
+                    edge_ends[row] = col
+                end
+            end
+        end
+
+        # Pre-process Cn to get nodes of each edge
+        edge_to_nodes = [Int[] for _ in 1:ne]
+        for j in 1:nn_free
+            for idx in Cn.colptr[j]:(Cn.colptr[j+1]-1)
+                push!(edge_to_nodes[Cn.rowval[idx]], j)
+            end
+        end
+
+        for k in 1:ne
+            nodes = edge_to_nodes[k]
+            for n1 in nodes
+                # find Cn[k, n1]
+                val_n1 = 0.0
+                for idx in Cn.colptr[n1]:(Cn.colptr[n1+1]-1)
+                    if Cn.rowval[idx] == k; val_n1 = Cn.nzval[idx]; break; end
+                end
+                for n2 in nodes
+                    # find Cn[k, n2]
+                    val_n2 = 0.0
+                    for idx in Cn.colptr[n2]:(Cn.colptr[n2+1]-1)
+                        if Cn.rowval[idx] == k; val_n2 = Cn.nzval[idx]; break; end
+                    end
+                    nz_idx = find_nz_index(A, n1, n2)
+                    push!(q_to_nz[k], (nz_idx, val_n1 * val_n2))
+                end
+            end
+        end
+
+        # 2. Initialize LDLFactorization
+        # Fill diagonal to ensure initial symbolic/numeric pass works
+        for i in 1:nn_free; A.nzval[find_nz_index(A, i, i)] = 1.0; end
+        factor = LDLFactorizations.ldl(A)
+
+        # 3. Pre-allocate buffers
+        x = zeros(nn_free, 3)
+        λ = zeros(nn_free, 3)
+        grad_x = zeros(nn_free, 3)
+        q = zeros(ne)
+        grad_q = zeros(ne)
+        grad_Nf = zeros(topo.num_nodes, 3)
+        
+        member_lengths = zeros(ne)
+        member_forces = zeros(ne)
+        reactions = zeros(topo.num_nodes, 3)
+
+        Cf_Nf = zeros(ne, 3)
+        Q_Cf_Nf = zeros(ne, 3)
+        Pn = copy(problem.loads.free_node_loads)
+        Nf = zeros(topo.num_nodes, 3)
+        Nf_fixed = zeros(length(topo.fixed_node_indices), 3)
+
+        to = TimerOutput()
+        last_snapshot = nothing
+
+        new(A, factor, q_to_nz, edge_starts, edge_ends, node_to_free_idx,
+            Cn, Cf,
+            x, λ, grad_x, q, grad_q, grad_Nf,
+            member_lengths, member_forces, reactions,
+            Cf_Nf, Q_Cf_Nf, Pn, Nf, Nf_fixed,
+            to, last_snapshot)
+    end
+end
+
+# Helper to find nz index in SparseMatrixCSC
+function find_nz_index(A::SparseMatrixCSC, i::Integer, j::Integer)
+    for nz_idx in A.colptr[j]:(A.colptr[j+1]-1)
+        if A.rowval[nz_idx] == i
+            return nz_idx
+        end
+    end
+    error("Index ($i, $j) not found in sparse matrix")
+end
+
+"""
+    OptimizationState
+
+Mutable state that evolves during optimization.
+
+# Fields
+- `force_densities::Vector{Float64}`: Current force density values (optimization variables)
+- `variable_anchor_positions::Matrix{Float64}`: Current positions of variable anchors
+- `loss_trace::Vector{Float64}`: History of loss values
+- `penalty_trace::Vector{Float64}`: History of penalty values
+- `node_trace::Vector{Matrix{Float64}}`: History of node positions (if tracing enabled)
+- `iterations::Int`: Number of completed iterations
+- `cache::Union{Nothing,OptimizationCache}`: Pre-allocated solver buffers
+
+This struct is modified in-place during optimization. The force densities are
+the primary optimization variables.
+"""
 mutable struct OptimizationState
     force_densities::Vector{Float64}
     variable_anchor_positions::Matrix{Float64}
     loss_trace::Vector{Float64}
+    penalty_trace::Vector{Float64}
     node_trace::Vector{Matrix{Float64}}
     iterations::Int
+    cache::Union{Nothing, OptimizationCache}
 end
 
-OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = OptimizationState(force_densities, variable_anchor_positions, Float64[], Matrix{Float64}[], 0)
+OptimizationState(force_densities::Vector{Float64}, variable_anchor_positions::Matrix{Float64}) = 
+    OptimizationState(force_densities, variable_anchor_positions, Float64[], Float64[], Matrix{Float64}[], 0, nothing)
 
+"""
+    ObjectiveContext
+
+Context information passed to objective builders for index resolution.
+
+# Fields
+- `num_edges::Int`: Total number of edges
+- `num_nodes::Int`: Total number of nodes
+- `free_node_indices::Vector{Int}`: Which nodes are free
+- `fixed_node_indices::Vector{Int}`: Which nodes are fixed
+
+Used internally when parsing JSON objective specifications to resolve
+index references like "all edges" or "all free nodes".
+"""
 struct ObjectiveContext
     num_edges::Int
     num_nodes::Int
@@ -165,19 +644,44 @@ end
 
 default_bounds(ne::Int) = Bounds(fill(1e-8, ne), fill(Inf, ne))
 
-function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
+function current_fixed_positions!(dest::AbstractMatrix{T}, problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real}) where T
     anchor = problem.anchors
     ref = anchor.reference_positions
-    T = promote_type(eltype(ref), eltype(anchor_positions))
-    if isempty(anchor.variable_indices)
-        return T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
+    fixed_indices = problem.topology.fixed_node_indices
+    
+    # 1. Overlay reference positions of fixed nodes
+    # We assume 'ref' contains positions for the nodes listed in 'fixed_indices'
+    if size(ref, 1) == length(fixed_indices)
+        for dim in 1:3
+            for (i, node_idx) in enumerate(fixed_indices)
+                dest[node_idx, dim] = ref[i, dim]
+            end
+        end
+    elseif size(ref, 1) == problem.topology.num_nodes
+        # Fallback if 'ref' is a full matrix of all nodes
+        for dim in 1:3
+            for node_idx in fixed_indices
+                dest[node_idx, dim] = ref[node_idx, dim]
+            end
+        end
+    else
+        error("Dimension mismatch: reference_positions has $(size(ref, 1)) nodes but expected either $(length(fixed_indices)) (fixed only) or $(problem.topology.num_nodes) (all).")
     end
-    positions = T === eltype(ref) ? copy(ref) : convert(Matrix{T}, ref)
+    
+    # 2. Overlay variable anchors
     if !isempty(anchor.variable_indices)
-        anchors_converted = eltype(anchor_positions) === T ? anchor_positions : convert(Matrix{T}, anchor_positions)
-        positions[anchor.variable_indices, :] .= anchors_converted
+        for dim in 1:3
+            for (i, node_idx) in enumerate(anchor.variable_indices)
+                dest[node_idx, dim] = anchor_positions[i, dim]
+            end
+        end
     end
-    return positions
+    return dest
+end
+
+function current_fixed_positions(problem::OptimizationProblem, anchor_positions::AbstractMatrix{<:Real})
+    dest = zeros(eltype(anchor_positions), problem.topology.num_nodes, 3)
+    current_fixed_positions!(dest, problem, anchor_positions)
 end
 
 current_fixed_positions(problem::OptimizationProblem, state::OptimizationState) =
@@ -342,7 +846,12 @@ function parse_solver_options(parameters_json::JSON3.Object)
     max_iter = haskey(parameters_json, "MaxIterations") ? Int(parameters_json["MaxIterations"]) : 500
     freq = haskey(parameters_json, "UpdateFrequency") ? Int(parameters_json["UpdateFrequency"]) : 1
     show = haskey(parameters_json, "ShowIterations") ? Bool(parameters_json["ShowIterations"]) : false
-    SolverOptions(abs_tol, rel_tol, max_iter, freq, show)
+    
+    barrier_weight = haskey(parameters_json, "BarrierWeight") ? Float64(parameters_json["BarrierWeight"]) : 1000.0
+    barrier_sharpness = haskey(parameters_json, "BarrierSharpness") ? Float64(parameters_json["BarrierSharpness"]) : DEFAULT_BARRIER_SHARPNESS
+    auto_scale = haskey(parameters_json, "AutoScale") ? Bool(parameters_json["AutoScale"]) : true
+    
+    SolverOptions(abs_tol, rel_tol, max_iter, freq, show, barrier_weight, barrier_sharpness, auto_scale)
 end
 
 function parse_tracing_options(parameters_json::JSON3.Object)
@@ -435,7 +944,7 @@ end
 
 function build_parameters(problem::JSON3.Object, topo::NetworkTopology)
     if !haskey(problem, "Parameters")
-        return OptimizationParameters(AbstractObjective[], default_bounds(topo.num_edges), SolverOptions(1e-6, 1e-6, 1, 1, false), TracingOptions(false, 1))
+        return OptimizationParameters(AbstractObjective[], default_bounds(topo.num_edges), SolverOptions(1e-6, 1e-6, 1, 1, false, 1000.0, DEFAULT_BARRIER_SHARPNESS, true), TracingOptions(false, 1))
     end
 
     params_json = problem["Parameters"]
@@ -461,6 +970,7 @@ function build_problem(problem::JSON3.Object)
 
     problem_struct = OptimizationProblem(topo, loads, geometry, anchors, parameters)
     state = OptimizationState(q_init, anchors.initial_variable_positions)
+    state.cache = OptimizationCache(problem_struct)
 
     problem_struct, state
 end

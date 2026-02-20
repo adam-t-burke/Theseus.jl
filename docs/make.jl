@@ -39,8 +39,15 @@ makedocs(
     repo = "https://github.com/adam-t-burke/Theseus.jl",
     pages = [
         "Home" => "index.md",
-        "API"  => "src/api.md",
+        "Concepts" => [
+            "Force Density Method" => "concepts/fdm.md",
+            "Optimization" => "concepts/optimization.md",
+            "Objectives" => "concepts/objectives.md",
+        ],
+        "API Reference" => [
+            "Types" => "api/types.md",
+            "Core Functions" => "api/functions.md",
+            "Objectives" => "api/objectives.md",
+        ],
     ],
-    # optional: set the output directory (default is "build")
-    # builddir = joinpath(@__DIR__, "build"),
 )

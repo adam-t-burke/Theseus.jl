@@ -1,5 +1,10 @@
 import HTTP.WebSockets
 
+"""
+    assemble_xyz(snapshot::GeometrySnapshot) -> Matrix{Float64}
+
+Extract the full node position matrix from a geometry snapshot.
+"""
 function assemble_xyz(snapshot::GeometrySnapshot)
     snapshot.xyz_full
 end
@@ -19,6 +24,7 @@ function send_message(ws, problem::OptimizationProblem, state::OptimizationState
         "Y" => xyz[:, 2],
         "Z" => xyz[:, 3],
         "Losstrace" => copy(loss_trace_or_default(state.loss_trace)),
+        "Penaltytrace" => copy(loss_trace_or_default(state.penalty_trace)),
     )
     if include_trace
         payload["NodeTrace"] = copy(state.node_trace)
@@ -26,8 +32,19 @@ function send_message(ws, problem::OptimizationProblem, state::OptimizationState
     HTTP.WebSockets.send(ws, JSON3.write(payload))
 end
 
+"""
+    direct_solution!(problem, state, ws) -> GeometrySnapshot
+
+Solve the FDM directly without optimization (form-finding only).
+
+Used when no objectives are specified - simply computes the equilibrium
+geometry for the given force densities and sends the result via WebSocket.
+"""
 function direct_solution!(problem::OptimizationProblem, state::OptimizationState, ws)
-    snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions)
+    if isnothing(state.cache)
+        state.cache = OptimizationCache(problem)
+    end
+    snapshot = evaluate_geometry(problem, state.force_densities, state.variable_anchor_positions, state.cache)
     empty!(state.loss_trace)
     push!(state.loss_trace, 0.0)
     send_message(ws, problem, state, snapshot;
@@ -39,6 +56,26 @@ function direct_solution!(problem::OptimizationProblem, state::OptimizationState
     return snapshot
 end
 
+"""
+    FDMoptim!(problem, state, ws; max_norm=1.0) -> GeometrySnapshot
+
+Main entry point for form-finding and optimization with WebSocket communication.
+
+If objectives are defined, runs [`optimize_problem!`](@ref) with iteration callbacks
+that send progress updates via WebSocket. If no objectives are defined, runs
+[`direct_solution!`](@ref) for simple form-finding.
+
+# Arguments
+- `problem::OptimizationProblem`: Problem definition
+- `state::OptimizationState`: Initial state (modified in-place)
+- `ws`: WebSocket connection for sending results
+
+# Keyword Arguments
+- `max_norm::Float64=1.0`: Maximum gradient norm (unused, kept for API compatibility)
+
+# Returns
+Final `GeometrySnapshot` after optimization/solution.
+"""
 function FDMoptim!(problem::OptimizationProblem, state::OptimizationState, ws; max_norm::Float64 = 1.0)
     if isempty(problem.parameters.objectives)
         return direct_solution!(problem, state, ws)
